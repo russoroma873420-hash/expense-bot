@@ -4,7 +4,7 @@ import re
 import sqlite3
 from datetime import datetime
 
-from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
+from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update, BotCommand
 from telegram.ext import ApplicationBuilder, CallbackQueryHandler, CommandHandler, ContextTypes, MessageHandler, filters
 
 # Настройка логов
@@ -113,10 +113,20 @@ def build_categories_keyboard() -> InlineKeyboardMarkup:
 
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    keyboard = [
+        [InlineKeyboardButton("📊 Статистика", callback_data="menu_stats")],
+        [InlineKeyboardButton("❓ Справка", callback_data="menu_help")],
+    ]
+    reply_markup = InlineKeyboardMarkup(keyboard)
+    
     await update.message.reply_text(
-        "Привет! Отправь расход в формате: название сумма\n"
-        "Например: кофе 300\n"
-        "После этого выбери категорию из кнопок, и я сохраню запись."
+        "Привет! 👋\n\n"
+        "Я помогу вести семейный бюджет.\n\n"
+        "Отправь расход в формате: <b>название сумма</b>\n"
+        "Например: <b>кофе 300</b>\n\n"
+        "После этого выбери категорию, и я сохраню запись.",
+        parse_mode="HTML",
+        reply_markup=reply_markup,
     )
 
 
@@ -203,6 +213,45 @@ async def handle_category(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         return
 
     await query.answer()
+    
+    # Обработка меню-кнопок
+    if query.data == "menu_stats":
+        stats = get_monthly_stats()
+        from datetime import date
+        month_name = date.today().strftime("%B %Y")
+        
+        report = f"📊 <b>Отчет за {month_name}</b>\n\n"
+        report += f"💰 <b>Общие траты:</b> {stats['total']:.2f} ₽\n\n"
+        report += "👥 <b>По членам семьи:</b>\n"
+        if stats['by_user']:
+            for user_name, amount in stats['by_user']:
+                report += f"  • {user_name}: {amount:.2f} ₽\n"
+        else:
+            report += "  (нет данных)\n"
+        report += "\n"
+        report += "🏆 <b>Топ-3 категории:</b>\n"
+        if stats['top_categories']:
+            for i, (category, amount) in enumerate(stats['top_categories'], 1):
+                report += f"  {i}. {category}: {amount:.2f} ₽\n"
+        else:
+            report += "  (нет данных)\n"
+        
+        await query.edit_message_text(report, parse_mode="HTML")
+        return
+    
+    if query.data == "menu_help":
+        await query.edit_message_text(
+            "💡 <b>Как использовать бота:</b>\n\n"
+            "1️⃣ Отправь сообщение в формате: <b>название сумма</b>\n"
+            "   Например: <i>пицца 450</i>\n\n"
+            "2️⃣ Выбери категорию из предложенных кнопок\n\n"
+            "3️⃣ Расход будет сохранен в БД\n\n"
+            "/stats — просмотреть отчет за месяц",
+            parse_mode="HTML",
+        )
+        return
+    
+    # Обработка категорий расходов
     pending = context.user_data.get("pending_expense")
     if not pending:
         await query.edit_message_text(
@@ -241,6 +290,17 @@ def main() -> None:
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
     app.add_handler(CallbackQueryHandler(handle_category))
 
+    async def post_init(app):
+        """Установить меню команд в Telegram"""
+        await app.bot.set_my_commands(
+            [
+                BotCommand("start", "Начало"),
+                BotCommand("stats", "Статистика за месяц"),
+                BotCommand("help", "Справка"),
+            ]
+        )
+
+    app.post_init = post_init
     logger.info("Bot started")
     app.run_polling()
 
