@@ -69,6 +69,43 @@ def add_expense(user_id: int, user_name: str, item: str, amount: float, category
     conn.close()
 
 
+def get_monthly_stats() -> dict:
+    from datetime import date
+    current_month = date.today().strftime("%Y-%m")
+    
+    conn = sqlite3.connect(DB_PATH)
+    cursor = conn.cursor()
+    
+    # Общая сумма
+    cursor.execute(
+        "SELECT SUM(amount) FROM expenses WHERE created_at LIKE ?",
+        (f"{current_month}%",),
+    )
+    total = cursor.fetchone()[0] or 0
+    
+    # По пользователям
+    cursor.execute(
+        "SELECT user_name, SUM(amount) FROM expenses WHERE created_at LIKE ? GROUP BY user_name ORDER BY SUM(amount) DESC",
+        (f"{current_month}%",),
+    )
+    by_user = cursor.fetchall()
+    
+    # Топ-3 категории
+    cursor.execute(
+        "SELECT category, SUM(amount) FROM expenses WHERE created_at LIKE ? GROUP BY category ORDER BY SUM(amount) DESC LIMIT 3",
+        (f"{current_month}%",),
+    )
+    top_categories = cursor.fetchall()
+    
+    conn.close()
+    
+    return {
+        "total": total,
+        "by_user": by_user,
+        "top_categories": top_categories,
+    }
+
+
 def build_categories_keyboard() -> InlineKeyboardMarkup:
     buttons = [InlineKeyboardButton(text=cat, callback_data=cat) for cat in CATEGORIES]
     keyboard = [buttons[i : i + 2] for i in range(0, len(buttons), 2)]
@@ -88,6 +125,44 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
         "Используй сообщение в формате 'пицца 450' или 'такси 120'.\n"
         "Затем выбери категорию."
     )
+
+
+async def stats_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    user_id = update.effective_user.id
+    if user_id not in ALLOWED_USER_IDS:
+        await update.message.reply_text("Доступ запрещен")
+        return
+    
+    stats = get_monthly_stats()
+    
+    # Оформляем отчет
+    from datetime import date
+    month_name = date.today().strftime("%B %Y")
+    
+    report = f"📊 <b>Отчет за {month_name}</b>\n\n"
+    
+    # Общая сумма
+    report += f"💰 <b>Общие траты:</b> {stats['total']:.2f} ₽\n\n"
+    
+    # По пользователям
+    report += "👥 <b>По членам семьи:</b>\n"
+    if stats['by_user']:
+        for user_name, amount in stats['by_user']:
+            report += f"  • {user_name}: {amount:.2f} ₽\n"
+    else:
+        report += "  (нет данных)\n"
+    
+    report += "\n"
+    
+    # Топ-3 категории
+    report += "🏆 <b>Топ-3 категории:</b>\n"
+    if stats['top_categories']:
+        for i, (category, amount) in enumerate(stats['top_categories'], 1):
+            report += f"  {i}. {category}: {amount:.2f} ₽\n"
+    else:
+        report += "  (нет данных)\n"
+    
+    await update.message.reply_text(report, parse_mode="HTML")
 
 
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -162,6 +237,7 @@ def main() -> None:
 
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("help", help_command))
+    app.add_handler(CommandHandler("stats", stats_command))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
     app.add_handler(CallbackQueryHandler(handle_category))
 
