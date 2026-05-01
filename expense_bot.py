@@ -31,6 +31,12 @@ CATEGORIES = [
 # Разрешенные пользователи (владелец и жена)
 ALLOWED_USER_IDS = [652328822, 970623315]  # 652328822 - ты, 970623315 - Катя
 
+# Словарь имен пользователей для отображения
+USER_NAMES = {
+    652328822: "Александр",
+    970623315: "Екатерина",
+}
+
 EXPENSE_RE = re.compile(r"^(.+?)\s+(\d+(?:[.,]\d+)?)$")
 
 
@@ -85,10 +91,11 @@ def get_monthly_stats() -> dict:
     
     # По пользователям
     cursor.execute(
-        "SELECT user_name, SUM(amount) FROM expenses WHERE created_at LIKE ? GROUP BY user_name ORDER BY SUM(amount) DESC",
+        "SELECT user_id, SUM(amount) FROM expenses WHERE created_at LIKE ? GROUP BY user_id ORDER BY SUM(amount) DESC",
         (f"{current_month}%",),
     )
-    by_user = cursor.fetchall()
+    by_user_raw = cursor.fetchall()
+    by_user = [(USER_NAMES.get(user_id, f"ID:{user_id}"), amount) for user_id, amount in by_user_raw]
     
     # Топ-3 категории
     cursor.execute(
@@ -262,7 +269,7 @@ async def handle_category(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
     category = query.data
     add_expense(
         user_id=user_id,
-        user_name=update.effective_user.full_name,
+        user_name=USER_NAMES.get(user_id, update.effective_user.full_name or "Неизвестный"),
         item=pending["item"],
         amount=pending["amount"],
         category=category,
@@ -270,7 +277,7 @@ async def handle_category(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
     context.user_data.pop("pending_expense", None)
 
     await query.edit_message_text(
-        f"Сохранено: {pending['item']} — {pending['amount']:.2f} ₽\nКатегория: {category}\nДобавил: {update.effective_user.full_name}"
+        f"Сохранено: {pending['item']} — {pending['amount']:.2f} ₽\nКатегория: {category}\nДобавил: {USER_NAMES.get(user_id, update.effective_user.full_name or 'Неизвестный')}"
     )
 
 
