@@ -2,7 +2,9 @@ import logging
 import os
 import re
 import sqlite3
-from datetime import datetime
+import csv
+import io
+from datetime import datetime, date, timedelta
 
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update, BotCommand
 from telegram.ext import ApplicationBuilder, CallbackQueryHandler, CommandHandler, ContextTypes, MessageHandler, filters
@@ -64,15 +66,127 @@ def init_db() -> None:
     conn.close()
 
 
-def add_expense(user_id: int, user_name: str, item: str, amount: float, category: str) -> None:
+def add_expense(user_id: int, user_name: str, item: str, amount: float, category: str) -> int:
     conn = sqlite3.connect(DB_PATH)
     cursor = conn.cursor()
     cursor.execute(
         "INSERT INTO expenses (user_id, user_name, item, amount, category, created_at) VALUES (?, ?, ?, ?, ?, ?)",
         (user_id, user_name, item, amount, category, datetime.utcnow().isoformat()),
     )
+    expense_id = cursor.lastrowid
     conn.commit()
     conn.close()
+    return expense_id
+
+
+def delete_expense(expense_id: int) -> bool:
+    conn = sqlite3.connect(DB_PATH)
+    cursor = conn.cursor()
+    cursor.execute("DELETE FROM expenses WHERE id = ?", (expense_id,))
+    deleted = cursor.rowcount > 0
+    conn.commit()
+    conn.close()
+    return deleted
+
+
+def get_recent_expenses(limit: int = 10) -> list:
+    conn = sqlite3.connect(DB_PATH)
+    cursor = conn.cursor()
+    cursor.execute(
+        "SELECT id, user_name, item, amount, category, created_at FROM expenses ORDER BY created_at DESC LIMIT ?",
+        (limit,),
+    )
+    expenses = cursor.fetchall()
+    conn.close()
+    return expenses
+
+
+def get_monthly_report(year: int, month: int) -> tuple:
+    # Получаем первый и последний день месяца
+    start_date = date(year, month, 1)
+    if month == 12:
+        end_date = date(year + 1, 1, 1) - timedelta(days=1)
+    else:
+        end_date = date(year, month + 1, 1) - timedelta(days=1)
+    
+    start_str = start_date.strftime("%Y-%m-%d")
+    end_str = end_date.strftime("%Y-%m-%d")
+    
+    conn = sqlite3.connect(DB_PATH)
+    cursor = conn.cursor()
+    
+    # Общая сумма
+    cursor.execute(
+        "SELECT SUM(amount) FROM expenses WHERE date(created_at) BETWEEN ? AND ?",
+        (start_str, end_str),
+    )
+    total = cursor.fetchone()[0] or 0
+    
+    # По пользователям
+    cursor.execute(
+        "SELECT user_id, SUM(amount) FROM expenses WHERE date(created_at) BETWEEN ? AND ? GROUP BY user_id ORDER BY SUM(amount) DESC",
+        (start_str, end_str),
+    )
+    by_user_raw = cursor.fetchall()
+    by_user = [(USER_NAMES.get(user_id, f"ID:{user_id}"), amount) for user_id, amount in by_user_raw]
+    
+    # Хронология
+    cursor.execute(
+        "SELECT user_name, item, amount, category, created_at FROM expenses WHERE date(created_at) BETWEEN ? AND ? ORDER BY created_at DESC",
+        (start_str, end_str),
+    )
+    timeline = cursor.fetchall()
+    
+    conn.close()
+    
+    return total, by_user, timeline
+
+
+def format_report(total: float, by_user: list, timeline: list, month_name: str) -> str:
+    report = f"📊 <b>Отчет за {month_name}</b>\n\n"
+    report += f"💰 <b>Общие траты:</b> {total:.2f} ₽\n\n"
+    
+    report += "👥 <b>По членам семьи:</b>\n"
+    if by_user:
+        for user_name, amount in by_user:
+            report += f"  • {user_name}: {amount:.2f} ₽\n"
+    else:
+        report += "  (нет данных)\n"
+    
+    report += "\n📅 <b>Хронология:</b>\n"
+    if timeline:
+        for user_name, item, amount, category, created_at in timeline:
+            dt = datetime.fromisoformat(created_at)
+            time_str = dt.strftime("%d.%m %H:%M")
+            report += f"  {time_str} {item} — {amount:.2f} ₽ ({category}) | {user_name}\n"
+    else:
+        report += "  (нет данных)\n"
+    
+    return report
+
+
+def create_csv_report(total: float, by_user: list, timeline: list, month_name: str) -> io.StringIO:
+    output = io.StringIO()
+    writer = csv.writer(output, delimiter=';')
+    
+    writer.writerow([f"Отчет за {month_name}"])
+    writer.writerow([])
+    writer.writerow(["Общие траты", f"{total:.2f} руб."])
+    writer.writerow([])
+    writer.writerow(["По членам семьи"])
+    for user_name, amount in by_user:
+        writer.writerow([user_name, f"{amount:.2f} руб."])
+    writer.writerow([])
+    writer.writerow(["Хронология"])
+    writer.writerow(["Дата", "Время", "Наименование", "Сумма", "Категория", "Кто добавил"])
+    for user_name, item, amount, category, created_at in timeline:
+        dt = datetime.fromisoformat(created_at)
+        date_str = dt.strftime("%d.%m.%Y")
+        time_str = dt.strftime("%H:%M")
+        writer.writerow([date_str, time_str, item, f"{amount:.2f}", category, user_name])
+    
+    output.seek(0)
+    return output
 
 
 def get_monthly_stats() -> dict:
@@ -144,42 +258,46 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
     )
 
 
-async def stats_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+async def recent_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     user_id = update.effective_user.id
     if user_id not in ALLOWED_USER_IDS:
         await update.message.reply_text("Доступ запрещен")
         return
     
-    stats = get_monthly_stats()
+    expenses = get_recent_expenses(10)
+    if not expenses:
+        await update.message.reply_text("📝 Нет сохраненных расходов")
+        return
     
-    # Оформляем отчет
-    from datetime import date
-    month_name = date.today().strftime("%B %Y")
+    text = "📝 <b>Последние расходы:</b>\n\n"
+    keyboard = []
     
-    report = f"📊 <b>Отчет за {month_name}</b>\n\n"
+    for expense_id, user_name, item, amount, category, created_at in expenses:
+        dt = datetime.fromisoformat(created_at)
+        time_str = dt.strftime("%d.%m %H:%M")
+        text += f"• {time_str} {item} — {amount:.2f} ₽ ({category}) | {user_name}\n"
+        keyboard.append([InlineKeyboardButton(f"❌ Удалить: {item[:20]}...", callback_data=f"delete_{expense_id}")])
     
-    # Общая сумма
-    report += f"💰 <b>Общие траты:</b> {stats['total']:.2f} ₽\n\n"
+    reply_markup = InlineKeyboardMarkup(keyboard)
+    await update.message.reply_text(text, parse_mode="HTML", reply_markup=reply_markup)
+
+
+async def report_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    user_id = update.effective_user.id
+    if user_id not in ALLOWED_USER_IDS:
+        await update.message.reply_text("Доступ запрещен")
+        return
     
-    # По пользователям
-    report += "👥 <b>По членам семьи:</b>\n"
-    if stats['by_user']:
-        for user_name, amount in stats['by_user']:
-            report += f"  • {user_name}: {amount:.2f} ₽\n"
-    else:
-        report += "  (нет данных)\n"
+    keyboard = [
+        [InlineKeyboardButton("📅 Текущий месяц", callback_data="report_current")],
+        [InlineKeyboardButton("📅 Прошлый месяц", callback_data="report_previous")],
+    ]
+    reply_markup = InlineKeyboardMarkup(keyboard)
     
-    report += "\n"
-    
-    # Топ-3 категории
-    report += "🏆 <b>Топ-3 категории:</b>\n"
-    if stats['top_categories']:
-        for i, (category, amount) in enumerate(stats['top_categories'], 1):
-            report += f"  {i}. {category}: {amount:.2f} ₽\n"
-    else:
-        report += "  (нет данных)\n"
-    
-    await update.message.reply_text(report, parse_mode="HTML")
+    await update.message.reply_text(
+        "📊 Выберите период для отчета:",
+        reply_markup=reply_markup
+    )
 
 
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -221,6 +339,58 @@ async def handle_category(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
 
     await query.answer()
     
+    # Обработка отмены только что добавленного расхода
+    if query.data.startswith("cancel_"):
+        expense_id = int(query.data.split("_")[1])
+        if delete_expense(expense_id):
+            await query.edit_message_text("❌ Запись отменена")
+        else:
+            await query.edit_message_text("⚠️ Не удалось отменить запись")
+        return
+    
+    # Обработка удаления из списка последних расходов
+    if query.data.startswith("delete_"):
+        expense_id = int(query.data.split("_")[1])
+        if delete_expense(expense_id):
+            await query.edit_message_text("✅ Запись удалена")
+        else:
+            await query.edit_message_text("⚠️ Не удалось удалить запись")
+        return
+    
+    # Обработка отчетов
+    if query.data.startswith("report_"):
+        today = date.today()
+        if query.data == "report_current":
+            year, month = today.year, today.month
+            month_name = today.strftime("%B %Y")
+        elif query.data == "report_previous":
+            first_of_month = today.replace(day=1)
+            last_month = first_of_month - timedelta(days=1)
+            year, month = last_month.year, last_month.month
+            month_name = last_month.strftime("%B %Y")
+        else:
+            return
+        
+        total, by_user, timeline = get_monthly_report(year, month)
+        report_text = format_report(total, by_user, timeline, month_name)
+        
+        # Проверяем длину сообщения
+        if len(report_text) > 4000:  # Запас на форматирование
+            # Создаем CSV файл
+            csv_file = create_csv_report(total, by_user, timeline, month_name)
+            csv_content = csv_file.getvalue()
+            
+            # Отправляем файл
+            await query.message.reply_document(
+                document=io.BytesIO(csv_content.encode('utf-8-sig')),
+                filename=f"report_{year}_{month:02d}.csv",
+                caption=f"📊 Отчет за {month_name} (слишком длинный для сообщения)",
+            )
+            await query.edit_message_text("📄 Отчет отправлен файлом")
+        else:
+            await query.edit_message_text(report_text, parse_mode="HTML")
+        return
+    
     # Обработка меню-кнопок
     if query.data == "menu_stats":
         stats = get_monthly_stats()
@@ -253,7 +423,9 @@ async def handle_category(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
             "   Например: <i>пицца 450</i>\n\n"
             "2️⃣ Выбери категорию из предложенных кнопок\n\n"
             "3️⃣ Расход будет сохранен в БД\n\n"
-            "/stats — просмотреть отчет за месяц",
+            "/stats — просмотреть отчет за месяц\n"
+            "/recent — последние расходы с возможностью удаления\n"
+            "/report — детальный отчет с выбором периода",
             parse_mode="HTML",
         )
         return
@@ -267,7 +439,7 @@ async def handle_category(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         return
 
     category = query.data
-    add_expense(
+    expense_id = add_expense(
         user_id=user_id,
         user_name=USER_NAMES.get(user_id, update.effective_user.full_name or "Неизвестный"),
         item=pending["item"],
@@ -276,8 +448,13 @@ async def handle_category(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
     )
     context.user_data.pop("pending_expense", None)
 
+    # Кнопка отмены
+    keyboard = [[InlineKeyboardButton("❌ Отменить", callback_data=f"cancel_{expense_id}")]]
+    reply_markup = InlineKeyboardMarkup(keyboard)
+    
     await query.edit_message_text(
-        f"Сохранено: {pending['item']} — {pending['amount']:.2f} ₽\nКатегория: {category}\nДобавил: {USER_NAMES.get(user_id, update.effective_user.full_name or 'Неизвестный')}"
+        f"✅ Сохранено: {pending['item']} — {pending['amount']:.2f} ₽\nКатегория: {category}\nДобавил: {USER_NAMES.get(user_id, update.effective_user.full_name or 'Неизвестный')}",
+        reply_markup=reply_markup
     )
 
 
@@ -294,6 +471,8 @@ def main() -> None:
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("help", help_command))
     app.add_handler(CommandHandler("stats", stats_command))
+    app.add_handler(CommandHandler("recent", recent_command))
+    app.add_handler(CommandHandler("report", report_command))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
     app.add_handler(CallbackQueryHandler(handle_category))
 
@@ -303,6 +482,8 @@ def main() -> None:
             [
                 BotCommand("start", "Начало"),
                 BotCommand("stats", "Статистика за месяц"),
+                BotCommand("recent", "Последние расходы"),
+                BotCommand("report", "Детальный отчет"),
                 BotCommand("help", "Справка"),
             ]
         )
