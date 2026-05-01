@@ -28,6 +28,9 @@ CATEGORIES = [
     "Другое",
 ]
 
+# Заглушки для разрешенных пользователей
+ALLOWED_USER_IDS = [123456789, 987654321]  # замените на ваши реальные ID
+
 EXPENSE_RE = re.compile(r"^(.+?)\s+(\d+(?:[.,]\d+)?)$")
 
 
@@ -39,6 +42,7 @@ def init_db() -> None:
         CREATE TABLE IF NOT EXISTS expenses (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             user_id INTEGER,
+            user_name TEXT,
             item TEXT,
             amount REAL,
             category TEXT,
@@ -46,16 +50,20 @@ def init_db() -> None:
         )
         """
     )
+    cursor.execute("PRAGMA table_info(expenses)")
+    columns = [row[1] for row in cursor.fetchall()]
+    if "user_name" not in columns:
+        cursor.execute("ALTER TABLE expenses ADD COLUMN user_name TEXT")
     conn.commit()
     conn.close()
 
 
-def add_expense(user_id: int, item: str, amount: float, category: str) -> None:
+def add_expense(user_id: int, user_name: str, item: str, amount: float, category: str) -> None:
     conn = sqlite3.connect(DB_PATH)
     cursor = conn.cursor()
     cursor.execute(
-        "INSERT INTO expenses (user_id, item, amount, category, created_at) VALUES (?, ?, ?, ?, ?)",
-        (user_id, item, amount, category, datetime.utcnow().isoformat()),
+        "INSERT INTO expenses (user_id, user_name, item, amount, category, created_at) VALUES (?, ?, ?, ?, ?, ?)",
+        (user_id, user_name, item, amount, category, datetime.utcnow().isoformat()),
     )
     conn.commit()
     conn.close()
@@ -83,6 +91,11 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
 
 
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    user_id = update.effective_user.id
+    if user_id not in ALLOWED_USER_IDS:
+        await update.message.reply_text("Доступ запрещен")
+        return
+
     text = update.message.text.strip()
     match = EXPENSE_RE.match(text)
     if not match:
@@ -109,8 +122,12 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
 
 async def handle_category(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     query = update.callback_query
-    await query.answer()
+    user_id = update.effective_user.id
+    if user_id not in ALLOWED_USER_IDS:
+        await query.answer(text="Доступ запрещен", show_alert=True)
+        return
 
+    await query.answer()
     pending = context.user_data.get("pending_expense")
     if not pending:
         await query.edit_message_text(
@@ -120,7 +137,8 @@ async def handle_category(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
 
     category = query.data
     add_expense(
-        user_id=update.effective_user.id,
+        user_id=user_id,
+        user_name=update.effective_user.full_name,
         item=pending["item"],
         amount=pending["amount"],
         category=category,
@@ -128,7 +146,7 @@ async def handle_category(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
     context.user_data.pop("pending_expense", None)
 
     await query.edit_message_text(
-        f"Сохранено: {pending['item']} — {pending['amount']:.2f} ₽\nКатегория: {category}"
+        f"Сохранено: {pending['item']} — {pending['amount']:.2f} ₽\nКатегория: {category}\nДобавил: {update.effective_user.full_name}"
     )
 
 
