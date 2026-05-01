@@ -258,6 +258,33 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
     )
 
 
+async def stats_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    user_id = update.effective_user.id
+    if user_id not in ALLOWED_USER_IDS:
+        await update.message.reply_text("Доступ запрещен")
+        return
+
+    stats = get_monthly_stats()
+    month_name = date.today().strftime("%B %Y")
+    report = f"📊 <b>Отчет за {month_name}</b>\n\n"
+    report += f"💰 <b>Общие траты:</b> {stats['total']:.2f} ₽\n\n"
+    report += "👥 <b>По членам семьи:</b>\n"
+    if stats['by_user']:
+        for user_name, amount in stats['by_user']:
+            report += f"  • {user_name}: {amount:.2f} ₽\n"
+    else:
+        report += "  (нет данных)\n"
+    report += "\n"
+    report += "🏆 <b>Топ-3 категории:</b>\n"
+    if stats['top_categories']:
+        for i, (category, amount) in enumerate(stats['top_categories'], 1):
+            report += f"  {i}. {category}: {amount:.2f} ₽\n"
+    else:
+        report += "  (нет данных)\n"
+
+    await update.message.reply_text(report, parse_mode="HTML")
+
+
 async def recent_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     user_id = update.effective_user.id
     if user_id not in ALLOWED_USER_IDS:
