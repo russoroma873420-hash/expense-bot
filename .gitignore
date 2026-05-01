@@ -1,0 +1,19 @@
+# SQLite database file
+*.db
+
+# Virtual environments
+venv/
+.env/
+.env
+
+# Python cache
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+
+# Logs
+*.log
+
+# Editor directories
+.vscode/
