@@ -62,6 +62,17 @@ def init_db() -> None:
     columns = [row[1] for row in cursor.fetchall()]
     if "user_name" not in columns:
         cursor.execute("ALTER TABLE expenses ADD COLUMN user_name TEXT")
+
+    # Миграция старых записей: если в created_at только дата, дополняем временем 00:00:00
+    cursor.execute("SELECT id, created_at FROM expenses")
+    rows = cursor.fetchall()
+    for expense_id, created_at in rows:
+        if created_at and re.match(r"^\d{4}-\d{2}-\d{2}$", created_at):
+            cursor.execute(
+                "UPDATE expenses SET created_at = ? WHERE id = ?",
+                (f"{created_at}T00:00:00", expense_id),
+            )
+
     conn.commit()
     conn.close()
 
@@ -297,16 +308,13 @@ async def recent_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         return
     
     text = "📝 <b>Последние расходы:</b>\n\n"
-    keyboard = []
     
     for expense_id, user_name, item, amount, category, created_at in expenses:
         dt = datetime.fromisoformat(created_at)
         time_str = dt.strftime("%d.%m %H:%M")
         text += f"• {time_str} {item} — {amount:.2f} ₽ ({category}) | {user_name}\n"
-        keyboard.append([InlineKeyboardButton(f"❌ Удалить: {item[:20]}...", callback_data=f"delete_{expense_id}")])
     
-    reply_markup = InlineKeyboardMarkup(keyboard)
-    await update.message.reply_text(text, parse_mode="HTML", reply_markup=reply_markup)
+    await update.message.reply_text(text, parse_mode="HTML")
 
 
 async def report_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
