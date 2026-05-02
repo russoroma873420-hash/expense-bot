@@ -64,6 +64,15 @@ def init_db() -> None:
     if "user_name" not in columns:
         cursor.execute("ALTER TABLE expenses ADD COLUMN user_name TEXT")
 
+    cursor.execute(
+        """
+        CREATE TABLE IF NOT EXISTS custom_categories (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            name TEXT UNIQUE
+        )
+        """
+    )
+
     # Миграция старых записей: если в created_at только дата, дополняем временем 00:00:00
     cursor.execute("SELECT id, created_at FROM expenses")
     rows = cursor.fetchall()
@@ -76,6 +85,42 @@ def init_db() -> None:
 
     conn.commit()
     conn.close()
+
+
+def get_custom_categories() -> list:
+    conn = sqlite3.connect(DB_PATH)
+    cursor = conn.cursor()
+    cursor.execute("SELECT id, name FROM custom_categories ORDER BY id")
+    rows = cursor.fetchall()
+    conn.close()
+    return rows
+
+
+def add_custom_category(name: str) -> bool:
+    try:
+        conn = sqlite3.connect(DB_PATH)
+        cursor = conn.cursor()
+        cursor.execute("INSERT INTO custom_categories (name) VALUES (?)", (name,))
+        conn.commit()
+        conn.close()
+        return True
+    except sqlite3.IntegrityError:
+        return False
+
+
+def delete_custom_category(cat_id: int) -> bool:
+    conn = sqlite3.connect(DB_PATH)
+    cursor = conn.cursor()
+    cursor.execute("DELETE FROM custom_categories WHERE id = ?", (cat_id,))
+    deleted = cursor.rowcount > 0
+    conn.commit()
+    conn.close()
+    return deleted
+
+
+def get_all_categories() -> list:
+    custom = [name for _, name in get_custom_categories()]
+    return CATEGORIES + custom
 
 
 def add_expense(user_id: int, user_name: str, item: str, amount: float, category: str) -> int:
@@ -240,8 +285,10 @@ def get_monthly_stats() -> dict:
 
 
 def build_categories_keyboard() -> InlineKeyboardMarkup:
-    buttons = [InlineKeyboardButton(text=cat, callback_data=cat) for cat in CATEGORIES]
+    all_cats = get_all_categories()
+    buttons = [InlineKeyboardButton(text=cat, callback_data=f"cat_{cat}") for cat in all_cats]
     keyboard = [buttons[i : i + 2] for i in range(0, len(buttons), 2)]
+    keyboard.append([InlineKeyboardButton("➕ Новая категория", callback_data="new_category")])
     return InlineKeyboardMarkup(keyboard)
 
 
@@ -289,11 +336,10 @@ async def stats_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
     report += "\n"
     report += "⏱️ <b>Последние 3 операции:</b>\n"
     if stats['last_three']:
-        for idx, (user_name, item, amount, category, created_at) in enumerate(stats['last_three'], 1):
+        for user_name, item, amount, category, created_at in stats['last_three']:
             dt = datetime.fromisoformat(created_at)
             time_str = dt.strftime("%d.%m %H:%M")
-            prefix = "✨ " if idx == len(stats['last_three']) else ""
-            report += f"  {prefix}{time_str} {html.escape(item)} — {amount:.2f} ₽ ({html.escape(category)}) | {html.escape(user_name)}\n"
+            report += f"  {time_str} {html.escape(item)} — {amount:.2f} ₽ ({html.escape(category)}) | {html.escape(user_name)}\n"
     else:
         report += "  (нет данных)\n"
 
@@ -339,6 +385,28 @@ async def report_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     )
 
 
+async def categories_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    user_id = update.effective_user.id
+    if user_id not in ALLOWED_USER_IDS:
+        await update.message.reply_text("Доступ запрещен")
+        return
+
+    custom = get_custom_categories()
+    if not custom:
+        await update.message.reply_text("Своих категорий пока нет. Добавь через кнопку «➕ Новая категория» при вводе расхода.")
+        return
+
+    keyboard = [
+        [InlineKeyboardButton(f"❌ {name}", callback_data=f"delcat_{cid}")]
+        for cid, name in custom
+    ]
+    await update.message.reply_text(
+        "🗂 <b>Свои категории</b>\nНажми на категорию, чтобы удалить:",
+        parse_mode="HTML",
+        reply_markup=InlineKeyboardMarkup(keyboard),
+    )
+
+
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     user_id = update.effective_user.id
     if user_id not in ALLOWED_USER_IDS:
@@ -346,6 +414,27 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         return
 
     text = update.message.text.strip()
+
+    # Ввод названия новой категории
+    if context.user_data.get("adding_category"):
+        context.user_data.pop("adding_category")
+        name = text.strip()
+        if not name:
+            await update.message.reply_text("Название не может быть пустым.")
+            return
+        if add_custom_category(name):
+            await update.message.reply_text(f"✅ Категория «{html.escape(name)}» добавлена.")
+        else:
+            await update.message.reply_text(f"Категория «{html.escape(name)}» уже существует.")
+        # Если есть незавершённый расход — показываем обновлённую клавиатуру
+        if context.user_data.get("pending_expense"):
+            pending = context.user_data["pending_expense"]
+            await update.message.reply_text(
+                f"Запись: {pending['item']} — {pending['amount']:.2f}\nВыберите категорию:",
+                reply_markup=build_categories_keyboard(),
+            )
+        return
+
     match = EXPENSE_RE.match(text)
     if not match:
         await update.message.reply_text(
@@ -444,13 +533,15 @@ async def handle_category(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         else:
             report += "  (нет данных)\n"
         report += "\n"
-        report += "🏆 <b>Топ-3 категории:</b>\n"
-        if stats['top_categories']:
-            for i, (category, amount) in enumerate(stats['top_categories'], 1):
-                report += f"  {i}. {category}: {amount:.2f} ₽\n"
+        report += "⏱️ <b>Последние 3 операции:</b>\n"
+        if stats['last_three']:
+            for user_name, item, amount, category, created_at in stats['last_three']:
+                dt = datetime.fromisoformat(created_at)
+                time_str = dt.strftime("%d.%m %H:%M")
+                report += f"  {time_str} {html.escape(item)} — {amount:.2f} ₽ ({html.escape(category)}) | {html.escape(user_name)}\n"
         else:
             report += "  (нет данных)\n"
-        
+
         await query.edit_message_text(report, parse_mode="HTML")
         return
     
@@ -468,7 +559,36 @@ async def handle_category(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         )
         return
     
+    # Добавление новой категории
+    if query.data == "new_category":
+        context.user_data["adding_category"] = True
+        await query.edit_message_text("Введите название новой категории:")
+        return
+
+    # Удаление кастомной категории
+    if query.data.startswith("delcat_"):
+        cat_id = int(query.data.split("_")[1])
+        delete_custom_category(cat_id)
+        custom = get_custom_categories()
+        if custom:
+            keyboard = [
+                [InlineKeyboardButton(f"❌ {name}", callback_data=f"delcat_{cid}")]
+                for cid, name in custom
+            ]
+            keyboard.append([InlineKeyboardButton("« Назад", callback_data="menu_help")])
+            await query.edit_message_text(
+                "🗂 <b>Свои категории</b>\nНажми на категорию, чтобы удалить:",
+                parse_mode="HTML",
+                reply_markup=InlineKeyboardMarkup(keyboard),
+            )
+        else:
+            await query.edit_message_text("Своих категорий нет.")
+        return
+
     # Обработка категорий расходов
+    if not query.data.startswith("cat_"):
+        return
+
     pending = context.user_data.get("pending_expense")
     if not pending:
         await query.edit_message_text(
@@ -476,7 +596,7 @@ async def handle_category(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         )
         return
 
-    category = query.data
+    category = query.data[len("cat_"):]
     expense_id = add_expense(
         user_id=user_id,
         user_name=USER_NAMES.get(user_id, update.effective_user.full_name or "Неизвестный"),
@@ -499,7 +619,7 @@ async def handle_category(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
 def main() -> None:
     token = os.environ.get(
         "TELEGRAM_BOT_TOKEN",
-        "8679634637:AAECrey0UQN9kgdmpYrnHeyqrfwidI6_RwI",
+        "8679634637:AAHuPMSflptrsO8Bqxm1O90DfqhfVQS7Tks",
     )
 
     init_db()
@@ -511,17 +631,18 @@ def main() -> None:
     app.add_handler(CommandHandler("stats", stats_command))
     app.add_handler(CommandHandler("recent", recent_command))
     app.add_handler(CommandHandler("report", report_command))
+    app.add_handler(CommandHandler("categories", categories_command))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
     app.add_handler(CallbackQueryHandler(handle_category))
 
     async def post_init(app):
-        """Установить меню команд в Telegram"""
         await app.bot.set_my_commands(
             [
                 BotCommand("start", "Начало"),
                 BotCommand("stats", "Статистика за месяц"),
                 BotCommand("recent", "Последние расходы"),
                 BotCommand("report", "Детальный отчет"),
+                BotCommand("categories", "Управление своими категориями"),
                 BotCommand("help", "Справка"),
             ]
         )
