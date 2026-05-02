@@ -223,19 +223,19 @@ def get_monthly_stats() -> dict:
     by_user_raw = cursor.fetchall()
     by_user = [(USER_NAMES.get(user_id, f"ID:{user_id}"), amount) for user_id, amount in by_user_raw]
     
-    # Топ-3 категории
+    # Последние 3 операции за текущий месяц
     cursor.execute(
-        "SELECT category, SUM(amount) FROM expenses WHERE created_at LIKE ? GROUP BY category ORDER BY SUM(amount) DESC LIMIT 3",
+        "SELECT user_name, item, amount, category, created_at FROM expenses WHERE created_at LIKE ? ORDER BY created_at DESC LIMIT 3",
         (f"{current_month}%",),
     )
-    top_categories = cursor.fetchall()
+    last_three = cursor.fetchall()
     
     conn.close()
     
     return {
         "total": total,
         "by_user": by_user,
-        "top_categories": top_categories,
+        "last_three": last_three,
     }
 
 
@@ -287,10 +287,13 @@ async def stats_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
     else:
         report += "  (нет данных)\n"
     report += "\n"
-    report += "🏆 <b>Топ-3 категории:</b>\n"
-    if stats['top_categories']:
-        for i, (category, amount) in enumerate(stats['top_categories'], 1):
-            report += f"  {i}. {category}: {amount:.2f} ₽\n"
+    report += "⏱️ <b>Последние 3 операции:</b>\n"
+    if stats['last_three']:
+        for idx, (user_name, item, amount, category, created_at) in enumerate(stats['last_three'], 1):
+            dt = datetime.fromisoformat(created_at)
+            time_str = dt.strftime("%d.%m %H:%M")
+            prefix = "✨ " if idx == len(stats['last_three']) else ""
+            report += f"  {prefix}{time_str} {html.escape(item)} — {amount:.2f} ₽ ({html.escape(category)}) | {html.escape(user_name)}\n"
     else:
         report += "  (нет данных)\n"
 
@@ -430,7 +433,6 @@ async def handle_category(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
     # Обработка меню-кнопок
     if query.data == "menu_stats":
         stats = get_monthly_stats()
-        from datetime import date
         month_name = date.today().strftime("%B %Y")
         
         report = f"📊 <b>Отчет за {month_name}</b>\n\n"
