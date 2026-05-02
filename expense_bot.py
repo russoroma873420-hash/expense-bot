@@ -4,6 +4,7 @@ import re
 import sqlite3
 import csv
 import io
+import html
 from datetime import datetime, date, timedelta
 
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update, BotCommand
@@ -160,7 +161,7 @@ def format_report(total: float, by_user: list, timeline: list, month_name: str) 
     report += "👥 <b>По членам семьи:</b>\n"
     if by_user:
         for user_name, amount in by_user:
-            report += f"  • {user_name}: {amount:.2f} ₽\n"
+            report += f"  • {html.escape(user_name)}: {amount:.2f} ₽\n"
     else:
         report += "  (нет данных)\n"
     
@@ -169,7 +170,7 @@ def format_report(total: float, by_user: list, timeline: list, month_name: str) 
         for user_name, item, amount, category, created_at in timeline:
             dt = datetime.fromisoformat(created_at)
             time_str = dt.strftime("%d.%m %H:%M")
-            report += f"  {time_str} {item} — {amount:.2f} ₽ ({category}) | {user_name}\n"
+            report += f"  {time_str} {html.escape(item)} — {amount:.2f} ₽ ({html.escape(category)}) | {html.escape(user_name)}\n"
     else:
         report += "  (нет данных)\n"
     
@@ -312,7 +313,7 @@ async def recent_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     for expense_id, user_name, item, amount, category, created_at in expenses:
         dt = datetime.fromisoformat(created_at)
         time_str = dt.strftime("%d.%m %H:%M")
-        text += f"• {time_str} {item} — {amount:.2f} ₽ ({category}) | {user_name}\n"
+        text += f"• {time_str} {html.escape(item)} — {amount:.2f} ₽ ({html.escape(category)}) | {html.escape(user_name)}\n"
     
     await update.message.reply_text(text, parse_mode="HTML")
 
