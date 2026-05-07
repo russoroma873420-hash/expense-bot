@@ -617,10 +617,9 @@ async def handle_category(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
 
 
 def main() -> None:
-    token = os.environ.get(
-        "TELEGRAM_BOT_TOKEN",
-        "8679634637:AAHuPMSflptrsO8Bqxm1O90DfqhfVQS7Tks",
-    )
+    token = os.environ.get("TELEGRAM_BOT_TOKEN")
+    if not token:
+        raise RuntimeError("TELEGRAM_BOT_TOKEN env var is not set")
 
     init_db()
 
