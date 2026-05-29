@@ -484,6 +484,42 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
     )
 
 
+async def diag_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    # Самодиагностика: проверяем доступ к Gemini прямо из чата, без логов сервера
+    user_id = update.effective_user.id
+    if user_id not in ALLOWED_USER_IDS:
+        await update.message.reply_text("Доступ запрещен")
+        return
+
+    lines = ["🔍 <b>Диагностика</b>\n"]
+
+    # 1. Виден ли ключ Gemini боту
+    api_key = os.environ.get("GEMINI_API_KEY")
+    if api_key:
+        lines.append(f"✅ GEMINI_API_KEY виден (…{html.escape(api_key[-4:])})")
+    else:
+        lines.append("❌ GEMINI_API_KEY НЕ виден боту")
+
+    # 2. Версия библиотеки
+    try:
+        ver = getattr(genai, "__version__", "?")
+        lines.append(f"✅ google-generativeai: {html.escape(str(ver))}")
+    except Exception as e:
+        lines.append(f"❌ Библиотека: {html.escape(str(e))}")
+
+    # 3. Пробный запрос к Gemini
+    if api_key:
+        try:
+            genai.configure(api_key=api_key)
+            model = genai.GenerativeModel("gemini-2.0-flash")
+            resp = model.generate_content("Ответь одним словом: работает")
+            lines.append(f"✅ Gemini отвечает: {html.escape(resp.text.strip()[:50])}")
+        except Exception as e:
+            lines.append(f"❌ Gemini не отвечает:\n<code>{html.escape(type(e).__name__)}: {html.escape(str(e))}</code>")
+
+    await update.message.reply_text("\n".join(lines), parse_mode="HTML")
+
+
 async def stats_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     user_id = update.effective_user.id
     if user_id not in ALLOWED_USER_IDS:
@@ -812,8 +848,11 @@ async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
 
     except Exception as e:
         logger.error(f"Ошибка при обработке фото: {e}")
+        # Показываем саму причину прямо в чат, чтобы не лазить в логи сервера
         await update.message.reply_text(
-            "❌ Ошибка при обработке чека. Пожалуйста, введите расход вручную в формате: название сумма"
+            f"❌ Ошибка при обработке чека:\n<code>{html.escape(type(e).__name__)}: {html.escape(str(e))}</code>\n\n"
+            "Можно ввести расход вручную в формате: название сумма",
+            parse_mode="HTML",
         )
 
 
@@ -1429,6 +1468,7 @@ def main() -> None:
     # Добавляем обработчики команд
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("help", help_command))
+    app.add_handler(CommandHandler("diag", diag_command))
     app.add_handler(CommandHandler("stats", stats_command))
     app.add_handler(CommandHandler("recent", recent_command))
     app.add_handler(CommandHandler("report", report_command))
@@ -1469,6 +1509,7 @@ def main() -> None:
                 BotCommand("goals", "Цели накопления"),
                 BotCommand("addgoal", "Добавить цель"),
                 BotCommand("contribute", "Пополнить цель"),
+                BotCommand("diag", "Проверка распознавания чеков"),
                 BotCommand("help", "Справка"),
             ]
         )
