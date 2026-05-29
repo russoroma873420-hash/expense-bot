@@ -6,9 +6,14 @@ import csv
 import io
 import html
 from datetime import datetime, date, timedelta
+import pytz
+import matplotlib.pyplot as plt
+import matplotlib.dates as mdates
+from io import BytesIO
 
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update, BotCommand
-from telegram.ext import ApplicationBuilder, CallbackQueryHandler, CommandHandler, ContextTypes, MessageHandler, filters
+from telegram.ext import ApplicationBuilder, CallbackQueryHandler, CommandHandler, ContextTypes, MessageHandler, filters, JobQueue
+from anthropic import Anthropic
 
 # Настройка логов
 logging.basicConfig(
@@ -33,6 +38,13 @@ CATEGORIES = [
 
 # Разрешенные пользователи (владелец и жена)
 ALLOWED_USER_IDS = [652328822, 970623315]  # 652328822 - ты, 970623315 - Катя
+
+# Семейный чат для уведомлений. Установи None или ID группы.
+# Как получить chat_id группы: добавь бота в группу, отправь любое сообщение, посмотри логи: "chat_id: -XXXXX"
+FAMILY_CHAT_ID = None
+
+# Timezone для расписания работ
+MOSCOW_TZ = pytz.timezone('Europe/Moscow')
 
 # Словарь имен пользователей для отображения
 USER_NAMES = {
@@ -83,6 +95,41 @@ def init_db() -> None:
                 (f"{created_at}T00:00:00", expense_id),
             )
 
+    # Таблица для настроек (лимиты, chat_id и т.д.)
+    cursor.execute(
+        """
+        CREATE TABLE IF NOT EXISTS settings (
+            key TEXT PRIMARY KEY,
+            value TEXT
+        )
+        """
+    )
+
+    # Таблица для регулярных расходов
+    cursor.execute(
+        """
+        CREATE TABLE IF NOT EXISTS regular_expenses (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            name TEXT,
+            amount REAL,
+            created_at TEXT
+        )
+        """
+    )
+
+    # Таблица для целей накопления
+    cursor.execute(
+        """
+        CREATE TABLE IF NOT EXISTS goals (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            name TEXT UNIQUE,
+            target_amount REAL,
+            current_amount REAL,
+            created_at TEXT
+        )
+        """
+    )
+
     conn.commit()
     conn.close()
 
@@ -118,6 +165,109 @@ def delete_custom_category(cat_id: int) -> bool:
     return deleted
 
 
+def get_setting(key: str) -> str:
+    conn = sqlite3.connect(DB_PATH)
+    cursor = conn.cursor()
+    cursor.execute("SELECT value FROM settings WHERE key = ?", (key,))
+    result = cursor.fetchone()
+    conn.close()
+    return result[0] if result else None
+
+
+def set_setting(key: str, value: str) -> None:
+    conn = sqlite3.connect(DB_PATH)
+    cursor = conn.cursor()
+    cursor.execute("INSERT OR REPLACE INTO settings (key, value) VALUES (?, ?)", (key, value))
+    conn.commit()
+    conn.close()
+
+
+def add_regular_expense(name: str, amount: float) -> int:
+    conn = sqlite3.connect(DB_PATH)
+    cursor = conn.cursor()
+    cursor.execute(
+        "INSERT INTO regular_expenses (name, amount, created_at) VALUES (?, ?, ?)",
+        (name, amount, datetime.utcnow().isoformat()),
+    )
+    expense_id = cursor.lastrowid
+    conn.commit()
+    conn.close()
+    return expense_id
+
+
+def get_regular_expenses() -> list:
+    conn = sqlite3.connect(DB_PATH)
+    cursor = conn.cursor()
+    cursor.execute("SELECT id, name, amount FROM regular_expenses ORDER BY id")
+    expenses = cursor.fetchall()
+    conn.close()
+    return expenses
+
+
+def delete_regular_expense(expense_id: int) -> bool:
+    conn = sqlite3.connect(DB_PATH)
+    cursor = conn.cursor()
+    cursor.execute("DELETE FROM regular_expenses WHERE id = ?", (expense_id,))
+    deleted = cursor.rowcount > 0
+    conn.commit()
+    conn.close()
+    return deleted
+
+
+def add_goal(name: str, target_amount: float) -> int:
+    try:
+        conn = sqlite3.connect(DB_PATH)
+        cursor = conn.cursor()
+        cursor.execute(
+            "INSERT INTO goals (name, target_amount, current_amount, created_at) VALUES (?, ?, ?, ?)",
+            (name, target_amount, 0, datetime.utcnow().isoformat()),
+        )
+        goal_id = cursor.lastrowid
+        conn.commit()
+        conn.close()
+        return goal_id
+    except sqlite3.IntegrityError:
+        return -1
+
+
+def get_goals() -> list:
+    conn = sqlite3.connect(DB_PATH)
+    cursor = conn.cursor()
+    cursor.execute("SELECT id, name, target_amount, current_amount FROM goals ORDER BY id")
+    goals = cursor.fetchall()
+    conn.close()
+    return goals
+
+
+def get_goal_by_name(name: str) -> tuple:
+    conn = sqlite3.connect(DB_PATH)
+    cursor = conn.cursor()
+    cursor.execute("SELECT id, name, target_amount, current_amount FROM goals WHERE name = ?", (name,))
+    result = cursor.fetchone()
+    conn.close()
+    return result
+
+
+def update_goal(goal_id: int, current_amount: float) -> bool:
+    conn = sqlite3.connect(DB_PATH)
+    cursor = conn.cursor()
+    cursor.execute("UPDATE goals SET current_amount = ? WHERE id = ?", (current_amount, goal_id))
+    success = cursor.rowcount > 0
+    conn.commit()
+    conn.close()
+    return success
+
+
+def delete_goal(goal_id: int) -> bool:
+    conn = sqlite3.connect(DB_PATH)
+    cursor = conn.cursor()
+    cursor.execute("DELETE FROM goals WHERE id = ?", (goal_id,))
+    deleted = cursor.rowcount > 0
+    conn.commit()
+    conn.close()
+    return deleted
+
+
 def get_all_categories() -> list:
     custom = [name for _, name in get_custom_categories()]
     return CATEGORIES + custom
@@ -144,6 +294,23 @@ def delete_expense(expense_id: int) -> bool:
     conn.commit()
     conn.close()
     return deleted
+
+
+def update_expense(expense_id: int, **kwargs) -> bool:
+    conn = sqlite3.connect(DB_PATH)
+    cursor = conn.cursor()
+    allowed_fields = ["item", "amount"]
+    updates = {k: v for k, v in kwargs.items() if k in allowed_fields}
+    if not updates:
+        conn.close()
+        return False
+    set_clause = ", ".join(f"{k} = ?" for k in updates.keys())
+    values = list(updates.values()) + [expense_id]
+    cursor.execute(f"UPDATE expenses SET {set_clause} WHERE id = ?", values)
+    success = cursor.rowcount > 0
+    conn.commit()
+    conn.close()
+    return success
 
 
 def get_recent_expenses(limit: int = 10) -> list:
@@ -351,20 +518,26 @@ async def recent_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     if user_id not in ALLOWED_USER_IDS:
         await update.message.reply_text("Доступ запрещен")
         return
-    
+
     expenses = get_recent_expenses(10)
     if not expenses:
         await update.message.reply_text("📝 Нет сохраненных расходов")
         return
-    
+
     text = "📝 <b>Последние расходы:</b>\n\n"
-    
+    keyboard = []
+
     for expense_id, user_name, item, amount, category, created_at in expenses:
         dt = datetime.fromisoformat(created_at)
         time_str = dt.strftime("%d.%m %H:%M")
         text += f"• {time_str} {html.escape(item)} — {amount:.2f} ₽ ({html.escape(category)}) | {html.escape(user_name)}\n"
-    
-    await update.message.reply_text(text, parse_mode="HTML")
+        keyboard.append([
+            InlineKeyboardButton("✏️", callback_data=f"edit_expense_{expense_id}"),
+            InlineKeyboardButton("❌", callback_data=f"delete_{expense_id}"),
+        ])
+
+    reply_markup = InlineKeyboardMarkup(keyboard)
+    await update.message.reply_text(text, parse_mode="HTML", reply_markup=reply_markup)
 
 
 async def report_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -372,13 +545,14 @@ async def report_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     if user_id not in ALLOWED_USER_IDS:
         await update.message.reply_text("Доступ запрещен")
         return
-    
+
     keyboard = [
         [InlineKeyboardButton("📅 Текущий месяц", callback_data="report_current")],
         [InlineKeyboardButton("📅 Прошлый месяц", callback_data="report_previous")],
+        [InlineKeyboardButton("📊 График", callback_data="chart_current")],
     ]
     reply_markup = InlineKeyboardMarkup(keyboard)
-    
+
     await update.message.reply_text(
         "📊 Выберите период для отчета:",
         reply_markup=reply_markup
@@ -407,6 +581,262 @@ async def categories_command(update: Update, context: ContextTypes.DEFAULT_TYPE)
     )
 
 
+async def setlimit_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    user_id = update.effective_user.id
+    if user_id not in ALLOWED_USER_IDS:
+        await update.message.reply_text("Доступ запрещен")
+        return
+
+    if not context.args or len(context.args) != 1:
+        await update.message.reply_text("Использование: /setlimit 50000")
+        return
+
+    try:
+        limit = float(context.args[0])
+        if limit <= 0:
+            await update.message.reply_text("Лимит должен быть положительным числом")
+            return
+        set_setting("monthly_limit", str(limit))
+        await update.message.reply_text(f"✅ Месячный лимит установлен: {limit:.2f} ₽")
+    except ValueError:
+        await update.message.reply_text("Ошибка: введи число, например 50000 или 50000.50")
+
+
+async def regular_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    user_id = update.effective_user.id
+    if user_id not in ALLOWED_USER_IDS:
+        await update.message.reply_text("Доступ запрещен")
+        return
+
+    regular = get_regular_expenses()
+    keyboard = []
+
+    for exp_id, name, amount in regular:
+        keyboard.append([
+            InlineKeyboardButton(f"➕ {name} ({amount:.2f}₽)", callback_data=f"add_regular_{exp_id}"),
+            InlineKeyboardButton("❌", callback_data=f"del_regular_{exp_id}")
+        ])
+
+    keyboard.append([InlineKeyboardButton("➕ Добавить регулярный", callback_data="new_regular")])
+
+    if regular:
+        await update.message.reply_text(
+            "📋 <b>Регулярные расходы:</b>",
+            parse_mode="HTML",
+            reply_markup=InlineKeyboardMarkup(keyboard),
+        )
+    else:
+        await update.message.reply_text(
+            "📋 Регулярных расходов нет. Добавь новый:",
+            reply_markup=InlineKeyboardMarkup(keyboard),
+        )
+
+
+async def goals_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    user_id = update.effective_user.id
+    if user_id not in ALLOWED_USER_IDS:
+        await update.message.reply_text("Доступ запрещен")
+        return
+
+    goals = get_goals()
+    keyboard = []
+    text = "🎯 <b>Цели накопления:</b>\n\n"
+
+    for goal_id, name, target, current in goals:
+        percentage = (current / target * 100) if target > 0 else 0
+        filled = int(percentage / 10)
+        bar = "█" * filled + "░" * (10 - filled)
+        text += f"{bar} {current:.0f}/{target:.0f} ₽ ({percentage:.0f}%)\n"
+        text += f"  {html.escape(name)}\n\n"
+        keyboard.append([
+            InlineKeyboardButton(f"➕ Пополнить", callback_data=f"contrib_goal_{goal_id}"),
+            InlineKeyboardButton("❌", callback_data=f"del_goal_{goal_id}")
+        ])
+
+    keyboard.append([InlineKeyboardButton("➕ Добавить цель", callback_data="new_goal")])
+
+    if goals:
+        await update.message.reply_text(
+            text,
+            parse_mode="HTML",
+            reply_markup=InlineKeyboardMarkup(keyboard),
+        )
+    else:
+        await update.message.reply_text(
+            "🎯 Целей накопления нет. Добавь новую:",
+            reply_markup=InlineKeyboardMarkup(keyboard),
+        )
+
+
+async def addgoal_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    user_id = update.effective_user.id
+    if user_id not in ALLOWED_USER_IDS:
+        await update.message.reply_text("Доступ запрещен")
+        return
+
+    if not context.args or len(context.args) < 2:
+        await update.message.reply_text("Использование: /addgoal Название 100000")
+        return
+
+    try:
+        name = " ".join(context.args[:-1])
+        target = float(context.args[-1])
+        if target <= 0:
+            await update.message.reply_text("Сумма должна быть положительной")
+            return
+        goal_id = add_goal(name, target)
+        if goal_id == -1:
+            await update.message.reply_text(f"Цель '{html.escape(name)}' уже существует", parse_mode="HTML")
+        else:
+            await update.message.reply_text(f"✅ Цель '{html.escape(name)}' создана на {target:.2f} ₽", parse_mode="HTML")
+    except ValueError:
+        await update.message.reply_text("Ошибка: введи число для суммы, например: /addgoal Отпуск 150000")
+
+
+async def contribute_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    user_id = update.effective_user.id
+    if user_id not in ALLOWED_USER_IDS:
+        await update.message.reply_text("Доступ запрещен")
+        return
+
+    if not context.args or len(context.args) < 2:
+        await update.message.reply_text("Использование: /contribute НазваниеЦели 5000")
+        return
+
+    try:
+        goal_name = " ".join(context.args[:-1])
+        amount = float(context.args[-1])
+        if amount <= 0:
+            await update.message.reply_text("Сумма должна быть положительной")
+            return
+
+        goal = get_goal_by_name(goal_name)
+        if not goal:
+            await update.message.reply_text(f"Цель '{html.escape(goal_name)}' не найдена", parse_mode="HTML")
+            return
+
+        goal_id, _, target, current = goal
+        new_current = current + amount
+        if update_goal(goal_id, new_current):
+            percentage = (new_current / target * 100) if target > 0 else 0
+            filled = int(percentage / 10)
+            bar = "█" * filled + "░" * (10 - filled)
+            await update.message.reply_text(
+                f"✅ Пополнено!\n\n🎯 {html.escape(goal_name)}\n{bar} {new_current:.0f}/{target:.0f} ₽ ({percentage:.0f}%)",
+                parse_mode="HTML"
+            )
+        else:
+            await update.message.reply_text("Ошибка при пополнении цели")
+    except ValueError:
+        await update.message.reply_text("Ошибка: введи число для суммы, например: /contribute Отпуск 5000")
+
+
+async def chart_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    user_id = update.effective_user.id
+    if user_id not in ALLOWED_USER_IDS:
+        await update.message.reply_text("Доступ запрещен")
+        return
+
+    today = date.today()
+    keyboard = [
+        [InlineKeyboardButton("📅 Этот месяц", callback_data="chart_current")],
+        [InlineKeyboardButton("📅 Прошлый месяц", callback_data="chart_previous")],
+        [InlineKeyboardButton("📝 Свой диапазон", callback_data="chart_custom")],
+    ]
+    reply_markup = InlineKeyboardMarkup(keyboard)
+
+    await update.message.reply_text(
+        "📊 Выберите период для графика:",
+        reply_markup=reply_markup
+    )
+
+
+async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    user_id = update.effective_user.id
+    if user_id not in ALLOWED_USER_IDS:
+        await update.message.reply_text("Доступ запрещен")
+        return
+
+    await update.message.reply_text("⏳ Анализирую чек...")
+
+    try:
+        file = await update.message.photo[-1].get_file()
+        photo_bytes = await file.download_as_bytearray()
+
+        api_key = os.environ.get("ANTHROPIC_API_KEY")
+        if not api_key:
+            await update.message.reply_text("❌ Ошибка: переменная ANTHROPIC_API_KEY не установлена")
+            return
+
+        import base64
+        photo_base64 = base64.standard_b64encode(photo_bytes).decode("utf-8")
+
+        client = Anthropic(api_key=api_key)
+        message = client.messages.create(
+            model="claude-sonnet-4-20250514",
+            max_tokens=1024,
+            messages=[
+                {
+                    "role": "user",
+                    "content": [
+                        {
+                            "type": "image",
+                            "source": {
+                                "type": "base64",
+                                "media_type": "image/jpeg",
+                                "data": photo_base64,
+                            },
+                        },
+                        {
+                            "type": "text",
+                            "text": "Посмотри на этот чек и извлеки основную информацию. Ответь в формате: НАЗВАНИЕ|СУММА (только число, без валюты). Например: кофе эспрессо|450 или пицца маргарита|650. Если на чеке несколько товаров, выбери самый дорогой. Если не можешь распознать чек, ответь только: ОШИБКА"
+                        }
+                    ],
+                }
+            ],
+        )
+
+        response_text = message.content[0].text.strip()
+
+        if "ОШИБКА" in response_text.upper():
+            await update.message.reply_text(
+                "❌ Не удалось распознать чек. Пожалуйста, введите расход в формате: название сумма\nНапример: кофе 300"
+            )
+            return
+
+        if "|" not in response_text:
+            await update.message.reply_text(
+                "❌ Не удалось распознать чек. Пожалуйста, введите расход в формате: название сумма\nНапример: кофе 300"
+            )
+            return
+
+        item, amount_str = response_text.split("|", 1)
+        item = item.strip()
+        amount_str = amount_str.strip().replace(",", ".")
+
+        try:
+            amount = float(amount_str)
+            if amount <= 0:
+                raise ValueError("Сумма должна быть положительной")
+        except ValueError:
+            await update.message.reply_text(
+                "❌ Не удалось распознать сумму на чеке. Пожалуйста, введите расход в формате: название сумма\nНапример: кофе 300"
+            )
+            return
+
+        context.user_data["pending_expense"] = {"item": item, "amount": amount}
+        await update.message.reply_text(
+            f"Запись: {item} — {amount:.2f}\nВыберите категорию:",
+            reply_markup=build_categories_keyboard(),
+        )
+
+    except Exception as e:
+        logger.error(f"Ошибка при обработке фото: {e}")
+        await update.message.reply_text(
+            "❌ Ошибка при обработке чека. Пожалуйста, введите расход вручную в формате: название сумма"
+        )
+
+
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     user_id = update.effective_user.id
     if user_id not in ALLOWED_USER_IDS:
@@ -433,6 +863,156 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
                 f"Запись: {pending['item']} — {pending['amount']:.2f}\nВыберите категорию:",
                 reply_markup=build_categories_keyboard(),
             )
+        return
+
+    # Добавление регулярного расхода
+    if context.user_data.get("adding_regular"):
+        context.user_data.pop("adding_regular")
+        match = EXPENSE_RE.match(text)
+        if not match:
+            await update.message.reply_text(
+                "Неверный формат. Используй: название сумма\nНапример: интернет 1500"
+            )
+            return
+        name = match.group(1).strip()
+        try:
+            amount = float(match.group(2).replace(",", "."))
+            add_regular_expense(name, amount)
+            await update.message.reply_text(f"✅ Регулярный расход «{html.escape(name)}» добавлен ({amount:.2f} ₽)", parse_mode="HTML")
+        except ValueError:
+            await update.message.reply_text("Ошибка при добавлении регулярного расхода")
+        return
+
+    # Добавление цели накопления
+    if context.user_data.get("adding_goal"):
+        context.user_data.pop("adding_goal")
+        match = EXPENSE_RE.match(text)
+        if not match:
+            await update.message.reply_text(
+                "Неверный формат. Используй: название сумма\nНапример: Отпуск 150000"
+            )
+            return
+        name = match.group(1).strip()
+        try:
+            amount = float(match.group(2).replace(",", "."))
+            goal_id = add_goal(name, amount)
+            if goal_id == -1:
+                await update.message.reply_text(f"Цель «{html.escape(name)}» уже существует", parse_mode="HTML")
+            else:
+                await update.message.reply_text(f"✅ Цель «{html.escape(name)}» создана на {amount:.2f} ₽", parse_mode="HTML")
+        except ValueError:
+            await update.message.reply_text("Ошибка при добавлении цели")
+        return
+
+    # Пополнение цели
+    if context.user_data.get("contrib_mode"):
+        context.user_data.pop("contrib_mode")
+        try:
+            amount = float(text.replace(",", "."))
+            goal_id = context.user_data.pop("contrib_goal_id")
+            goal = next((g for g in get_goals() if g[0] == goal_id), None)
+            if goal:
+                goal_id, name, target, current = goal
+                new_current = current + amount
+                if update_goal(goal_id, new_current):
+                    percentage = (new_current / target * 100) if target > 0 else 0
+                    filled = int(percentage / 10)
+                    bar = "█" * filled + "░" * (10 - filled)
+                    await update.message.reply_text(
+                        f"✅ Пополнено!\n\n🎯 {html.escape(name)}\n{bar} {new_current:.0f}/{target:.0f} ₽ ({percentage:.0f}%)",
+                        parse_mode="HTML"
+                    )
+        except ValueError:
+            await update.message.reply_text("Ошибка: введи число")
+        return
+
+    # Редактирование названия расхода
+    if context.user_data.get("edit_type") == "name":
+        expense_id = context.user_data.pop("edit_expense_id")
+        context.user_data.pop("edit_type")
+        if update_expense(expense_id, item=text.strip()):
+            await update.message.reply_text(f"✅ Название изменено на '{html.escape(text.strip())}'", parse_mode="HTML")
+        else:
+            await update.message.reply_text("❌ Ошибка при изменении названия")
+        return
+
+    # Редактирование суммы расхода
+    if context.user_data.get("edit_type") == "amount":
+        expense_id = context.user_data.pop("edit_expense_id")
+        context.user_data.pop("edit_type")
+        try:
+            amount = float(text.replace(",", "."))
+            if amount <= 0:
+                await update.message.reply_text("Сумма должна быть положительной")
+                return
+            if update_expense(expense_id, amount=amount):
+                await update.message.reply_text(f"✅ Сумма изменена на {amount:.2f} ₽")
+            else:
+                await update.message.reply_text("❌ Ошибка при изменении суммы")
+        except ValueError:
+            await update.message.reply_text("Ошибка: введи число")
+        return
+
+    # Ввод дат для собственного диапазона графика
+    if context.user_data.get("chart_mode") == "waiting_start":
+        try:
+            start_date = datetime.strptime(text, "%d.%m.%Y").date()
+            context.user_data["chart_start"] = start_date
+            context.user_data["chart_mode"] = "waiting_end"
+            await update.message.reply_text("Введите дату окончания в формате ДД.MM.ГГГГ")
+        except ValueError:
+            await update.message.reply_text("Неверный формат даты. Используй ДД.MM.ГГГГ")
+        return
+
+    if context.user_data.get("chart_mode") == "waiting_end":
+        try:
+            end_date = datetime.strptime(text, "%d.%m.%Y").date()
+            start_date = context.user_data.pop("chart_start")
+            context.user_data.pop("chart_mode")
+
+            if start_date > end_date:
+                await update.message.reply_text("Дата начала не может быть позже даты окончания")
+                return
+
+            conn = sqlite3.connect(DB_PATH)
+            cursor = conn.cursor()
+            cursor.execute(
+                "SELECT user_name, item, amount, category, created_at FROM expenses WHERE date(created_at) BETWEEN ? AND ? ORDER BY created_at DESC",
+                (start_date.strftime("%Y-%m-%d"), end_date.strftime("%Y-%m-%d")),
+            )
+            timeline = cursor.fetchall()
+            conn.close()
+
+            if not timeline:
+                await update.message.reply_text(f"📊 Нет данных с {start_date.strftime('%d.%m.%Y')} по {end_date.strftime('%d.%m.%Y')}")
+                return
+
+            # Собираем расходы по категориям
+            categories_dict = {}
+            for user_name, item, amount, category, created_at in timeline:
+                if category not in categories_dict:
+                    categories_dict[category] = 0
+                categories_dict[category] += amount
+
+            # Создаём диаграмму
+            fig, ax = plt.subplots(figsize=(10, 8))
+            categories = list(categories_dict.keys())
+            amounts = list(categories_dict.values())
+
+            ax.pie(amounts, labels=categories, autopct='%1.1f%%', startangle=90)
+            ax.set_title(f"Расходы по категориям с {start_date.strftime('%d.%m.%Y')} по {end_date.strftime('%d.%m.%Y')}")
+
+            # Сохраняем в BytesIO
+            img_buffer = BytesIO()
+            plt.savefig(img_buffer, format='png', bbox_inches='tight', dpi=100)
+            img_buffer.seek(0)
+            plt.close(fig)
+
+            month_name = f"{start_date.strftime('%d.%m.%Y')} - {end_date.strftime('%d.%m.%Y')}"
+            await update.message.reply_photo(photo=img_buffer, caption=f"📊 График за период {month_name}")
+
+        except ValueError:
+            await update.message.reply_text("Неверный формат даты. Используй ДД.MM.ГГГГ")
         return
 
     match = EXPENSE_RE.match(text)
@@ -585,6 +1165,156 @@ async def handle_category(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
             await query.edit_message_text("Своих категорий нет.")
         return
 
+    # Обработка графиков (диаграмм)
+    if query.data.startswith("chart_"):
+        today = date.today()
+        try:
+            if query.data == "chart_current":
+                year, month = today.year, today.month
+                month_name = today.strftime("%B %Y")
+            elif query.data == "chart_previous":
+                first_of_month = today.replace(day=1)
+                last_month = first_of_month - timedelta(days=1)
+                year, month = last_month.year, last_month.month
+                month_name = last_month.strftime("%B %Y")
+            elif query.data == "chart_custom_start":
+                await query.edit_message_text("Введите дату начала в формате ДД.MM.ГГГГ")
+                context.user_data["chart_mode"] = "waiting_start"
+                return
+            else:
+                return
+
+            total, by_user, timeline = get_monthly_report(year, month)
+
+            # Собираем расходы по категориям
+            categories_dict = {}
+            for user_name, item, amount, category, created_at in timeline:
+                if category not in categories_dict:
+                    categories_dict[category] = 0
+                categories_dict[category] += amount
+
+            if not categories_dict:
+                await query.edit_message_text(f"📊 Нет данных за {month_name}")
+                return
+
+            # Создаём диаграмму
+            fig, ax = plt.subplots(figsize=(10, 8))
+            categories = list(categories_dict.keys())
+            amounts = list(categories_dict.values())
+
+            ax.pie(amounts, labels=categories, autopct='%1.1f%%', startangle=90)
+            ax.set_title(f"Расходы по категориям за {month_name}")
+
+            # Сохраняем в BytesIO
+            img_buffer = BytesIO()
+            plt.savefig(img_buffer, format='png', bbox_inches='tight', dpi=100)
+            img_buffer.seek(0)
+            plt.close(fig)
+
+            await query.message.reply_photo(photo=img_buffer, caption=f"📊 График за {month_name}")
+            await query.edit_message_text("📊 График отправлен")
+
+        except ValueError as e:
+            await query.answer(text=f"Ошибка при создании графика: {e}", show_alert=True)
+        return
+
+    # Обработка регулярных расходов
+    if query.data == "new_regular":
+        context.user_data["adding_regular"] = True
+        await query.edit_message_text("Введите название и сумму регулярного расхода в формате: название сумма\nНапример: интернет 1500")
+        return
+
+    if query.data.startswith("add_regular_"):
+        exp_id = int(query.data.split("_")[-1])
+        regular = get_regular_expenses()
+        expense = next((e for e in regular if e[0] == exp_id), None)
+        if expense:
+            context.user_data["pending_expense"] = {"item": expense[1], "amount": expense[2]}
+            await query.edit_message_text(
+                f"Запись: {expense[1]} — {expense[2]:.2f}\nВыберите категорию:",
+                reply_markup=build_categories_keyboard(),
+            )
+
+    if query.data.startswith("del_regular_"):
+        exp_id = int(query.data.split("_")[-1])
+        if delete_regular_expense(exp_id):
+            await query.answer("✅ Регулярный расход удален")
+            regular = get_regular_expenses()
+            keyboard = []
+            for r_id, name, amount in regular:
+                keyboard.append([
+                    InlineKeyboardButton(f"➕ {name} ({amount:.2f}₽)", callback_data=f"add_regular_{r_id}"),
+                    InlineKeyboardButton("❌", callback_data=f"del_regular_{r_id}")
+                ])
+            keyboard.append([InlineKeyboardButton("➕ Добавить регулярный", callback_data="new_regular")])
+            await query.edit_message_text(
+                "📋 <b>Регулярные расходы:</b>",
+                parse_mode="HTML",
+                reply_markup=InlineKeyboardMarkup(keyboard),
+            )
+        return
+
+    # Обработка целей
+    if query.data == "new_goal":
+        context.user_data["adding_goal"] = True
+        await query.edit_message_text("Введите название и сумму цели в формате: название сумма\nНапример: Отпуск 150000")
+        return
+
+    if query.data.startswith("contrib_goal_"):
+        goal_id = int(query.data.split("_")[-1])
+        context.user_data["contrib_goal_id"] = goal_id
+        context.user_data["contrib_mode"] = True
+        await query.edit_message_text("Введите сумму для пополнения")
+        return
+
+    if query.data.startswith("del_goal_"):
+        goal_id = int(query.data.split("_")[-1])
+        if delete_goal(goal_id):
+            await query.answer("✅ Цель удалена")
+            goals = get_goals()
+            keyboard = []
+            text = "🎯 <b>Цели накопления:</b>\n\n"
+
+            for g_id, name, target, current in goals:
+                percentage = (current / target * 100) if target > 0 else 0
+                filled = int(percentage / 10)
+                bar = "█" * filled + "░" * (10 - filled)
+                text += f"{bar} {current:.0f}/{target:.0f} ₽ ({percentage:.0f}%)\n"
+                text += f"  {html.escape(name)}\n\n"
+                keyboard.append([
+                    InlineKeyboardButton(f"➕ Пополнить", callback_data=f"contrib_goal_{g_id}"),
+                    InlineKeyboardButton("❌", callback_data=f"del_goal_{g_id}")
+                ])
+
+            keyboard.append([InlineKeyboardButton("➕ Добавить цель", callback_data="new_goal")])
+            await query.edit_message_text(text, parse_mode="HTML", reply_markup=InlineKeyboardMarkup(keyboard))
+        return
+
+    # Обработка редактирования расходов
+    if query.data.startswith("edit_expense_"):
+        expense_id = int(query.data.split("_")[-1])
+        keyboard = [
+            [InlineKeyboardButton("Название", callback_data=f"edit_name_{expense_id}")],
+            [InlineKeyboardButton("Сумму", callback_data=f"edit_amount_{expense_id}")],
+        ]
+        await query.edit_message_text(
+            "Что вы хотите изменить?",
+            reply_markup=InlineKeyboardMarkup(keyboard),
+        )
+        return
+
+    if query.data.startswith("edit_name_") or query.data.startswith("edit_amount_"):
+        parts = query.data.split("_")
+        expense_id = int(parts[-1])
+        edit_type = "name" if "name" in query.data else "amount"
+        context.user_data["edit_expense_id"] = expense_id
+        context.user_data["edit_type"] = edit_type
+        if edit_type == "name":
+            await query.edit_message_text("Введите новое название")
+        else:
+            await query.edit_message_text("Введите новую сумму")
+        return
+
     # Обработка категорий расходов
     if not query.data.startswith("cat_"):
         return
@@ -606,14 +1336,102 @@ async def handle_category(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
     )
     context.user_data.pop("pending_expense", None)
 
+    user_name = USER_NAMES.get(user_id, update.effective_user.full_name or "Неизвестный")
+
+    # Проверка месячного бюджета
+    limit_str = get_setting("monthly_limit")
+    if limit_str:
+        limit = float(limit_str)
+        stats = get_monthly_stats()
+        total = stats['total']
+        remaining = limit - total
+
+        if total > limit:
+            await query.message.reply_text(f"🚨 <b>Бюджет на месяц превышен!</b>\nРасход: {total:.2f} ₽ из {limit:.2f} ₽", parse_mode="HTML")
+        elif remaining < limit * 0.2:
+            percentage = (remaining / limit) * 100
+            await query.message.reply_text(f"⚠️ <b>Внимание! Осталось {remaining:.2f} ₽ из {limit:.2f} ₽ бюджета ({percentage:.0f}%)</b>", parse_mode="HTML")
+
+    # Отправка уведомления в семейный чат
+    if FAMILY_CHAT_ID:
+        notification = f"💸 {html.escape(user_name)} добавил: {html.escape(pending['item'])} — {pending['amount']:.2f} ₽ ({html.escape(category)})"
+        try:
+            await context.bot.send_message(chat_id=FAMILY_CHAT_ID, text=notification, parse_mode="HTML")
+        except Exception as e:
+            logger.warning(f"Не удалось отправить уведомление в семейный чат: {e}")
+
     # Кнопка отмены
     keyboard = [[InlineKeyboardButton("❌ Отменить", callback_data=f"cancel_{expense_id}")]]
     reply_markup = InlineKeyboardMarkup(keyboard)
-    
+
     await query.edit_message_text(
-        f"✅ Сохранено: {pending['item']} — {pending['amount']:.2f} ₽\nКатегория: {category}\nДобавил: {USER_NAMES.get(user_id, update.effective_user.full_name or 'Неизвестный')}",
+        f"✅ Сохранено: {pending['item']} — {pending['amount']:.2f} ₽\nКатегория: {category}\nДобавил: {user_name}",
         reply_markup=reply_markup
     )
+
+
+async def weekly_summary(context: ContextTypes.DEFAULT_TYPE) -> None:
+    # Получаем текущую дату и вычисляем начало и конец недели (пн-вс)
+    today = date.today()
+    # Вычисляем понедельник этой недели
+    monday = today - timedelta(days=today.weekday())
+    sunday = monday + timedelta(days=6)
+
+    start_str = monday.strftime("%Y-%m-%d")
+    end_str = sunday.strftime("%Y-%m-%d")
+
+    conn = sqlite3.connect(DB_PATH)
+    cursor = conn.cursor()
+
+    # Общая сумма за неделю
+    cursor.execute(
+        "SELECT SUM(amount) FROM expenses WHERE date(created_at) BETWEEN ? AND ?",
+        (start_str, end_str),
+    )
+    total = cursor.fetchone()[0] or 0
+
+    # По пользователям
+    cursor.execute(
+        "SELECT user_id, SUM(amount) FROM expenses WHERE date(created_at) BETWEEN ? AND ? GROUP BY user_id ORDER BY SUM(amount) DESC",
+        (start_str, end_str),
+    )
+    by_user_raw = cursor.fetchall()
+    by_user = [(USER_NAMES.get(user_id, f"ID:{user_id}"), amount) for user_id, amount in by_user_raw]
+
+    # По категориям
+    cursor.execute(
+        "SELECT category, SUM(amount) FROM expenses WHERE date(created_at) BETWEEN ? AND ? GROUP BY category ORDER BY SUM(amount) DESC",
+        (start_str, end_str),
+    )
+    by_category = cursor.fetchall()
+
+    conn.close()
+
+    # Форматируем и отправляем сводку
+    week_str = f"{monday.strftime('%d.%m')} - {sunday.strftime('%d.%m.%Y')}"
+    text = f"📊 <b>Еженедельная сводка</b>\n<b>{week_str}</b>\n\n"
+    text += f"💰 <b>Всего за неделю:</b> {total:.2f} ₽\n\n"
+
+    text += "👥 <b>По членам семьи:</b>\n"
+    if by_user:
+        for user_name, amount in by_user:
+            text += f"  • {html.escape(user_name)}: {amount:.2f} ₽\n"
+    else:
+        text += "  (нет данных)\n"
+
+    text += "\n🏷️ <b>По категориям:</b>\n"
+    if by_category:
+        for category, amount in by_category:
+            text += f"  • {html.escape(category)}: {amount:.2f} ₽\n"
+    else:
+        text += "  (нет данных)\n"
+
+    # Отправляем обоим пользователям
+    for user_id in ALLOWED_USER_IDS:
+        try:
+            await context.bot.send_message(chat_id=user_id, text=text, parse_mode="HTML")
+        except Exception as e:
+            logger.error(f"Ошибка при отправке еженедельной сводки пользователю {user_id}: {e}")
 
 
 def main() -> None:
@@ -625,14 +1443,34 @@ def main() -> None:
 
     app = ApplicationBuilder().token(token).build()
 
+    # Добавляем обработчики команд
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("help", help_command))
     app.add_handler(CommandHandler("stats", stats_command))
     app.add_handler(CommandHandler("recent", recent_command))
     app.add_handler(CommandHandler("report", report_command))
     app.add_handler(CommandHandler("categories", categories_command))
+    app.add_handler(CommandHandler("setlimit", setlimit_command))
+    app.add_handler(CommandHandler("regular", regular_command))
+    app.add_handler(CommandHandler("chart", chart_command))
+    app.add_handler(CommandHandler("goals", goals_command))
+    app.add_handler(CommandHandler("addgoal", addgoal_command))
+    app.add_handler(CommandHandler("contribute", contribute_command))
+
+    # Обработчик фото ПЕРЕД текстовым (важно!)
+    app.add_handler(MessageHandler(filters.PHOTO, handle_photo))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
     app.add_handler(CallbackQueryHandler(handle_category))
+
+    # Настраиваем еженедельную сводку (воскресенье, 19:00 MSK)
+    job_queue = app.job_queue
+    job_queue.run_weekly(
+        weekly_summary,
+        day=6,  # 6 = воскресенье (0 = понедельник, ... 6 = воскресенье)
+        time=datetime.min.replace(hour=19, minute=0).time(),
+        name="weekly_summary",
+        tzinfo=MOSCOW_TZ,
+    )
 
     async def post_init(app):
         await app.bot.set_my_commands(
@@ -642,6 +1480,12 @@ def main() -> None:
                 BotCommand("recent", "Последние расходы"),
                 BotCommand("report", "Детальный отчет"),
                 BotCommand("categories", "Управление своими категориями"),
+                BotCommand("setlimit", "Установить месячный лимит"),
+                BotCommand("regular", "Регулярные расходы"),
+                BotCommand("chart", "График по категориям"),
+                BotCommand("goals", "Цели накопления"),
+                BotCommand("addgoal", "Добавить цель"),
+                BotCommand("contribute", "Пополнить цель"),
                 BotCommand("help", "Справка"),
             ]
         )
