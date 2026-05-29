@@ -20,7 +20,14 @@ from telegram.ext import ApplicationBuilder, CallbackQueryHandler, CommandHandle
 # Распознавание чеков через OpenRouter (работает из РФ, обходит гео-блок Google).
 # Ключ берётся из переменной окружения OPENROUTER_API_KEY.
 OPENROUTER_URL = "https://openrouter.ai/api/v1/chat/completions"
-OPENROUTER_MODEL = "qwen/qwen2.5-vl-72b-instruct:free"
+# Перебираем модели по порядку: берём первую, которая ответит.
+# Бесплатные (:free) идут первыми; если их пул занят (404/429) — пробуем следующую.
+OPENROUTER_MODELS = [
+    "qwen/qwen2.5-vl-72b-instruct:free",
+    "qwen/qwen2.5-vl-32b-instruct:free",
+    "meta-llama/llama-3.2-11b-vision-instruct:free",
+    "google/gemini-2.0-flash-exp:free",
+]
 RECEIPT_PROMPT = (
     "Посмотри на этот чек и извлеки основную информацию. "
     "Ответь строго в формате: НАЗВАНИЕ|СУММА (только число, без валюты). "
@@ -30,26 +37,41 @@ RECEIPT_PROMPT = (
 )
 
 
+def _openrouter_chat(content, api_key: str):
+    """Перебирает OPENROUTER_MODELS, возвращает (текст_ответа, имя_модели).
+    content — это значение поля message.content (строка или список частей)."""
+    headers = {"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"}
+    last_error = None
+    for model in OPENROUTER_MODELS:
+        payload = {"model": model, "messages": [{"role": "user", "content": content}]}
+        try:
+            resp = requests.post(OPENROUTER_URL, headers=headers, json=payload, timeout=60)
+            if resp.status_code in (404, 429, 502, 503):
+                # модель недоступна/занята — пробуем следующую
+                last_error = f"{model}: HTTP {resp.status_code}"
+                continue
+            resp.raise_for_status()
+            data = resp.json()
+            # некоторые провайдеры возвращают ошибку в теле с кодом 200
+            if "choices" not in data:
+                last_error = f"{model}: {str(data)[:200]}"
+                continue
+            return data["choices"][0]["message"]["content"].strip(), model
+        except Exception as e:
+            last_error = f"{model}: {type(e).__name__}: {e}"
+            continue
+    raise RuntimeError(f"Все модели недоступны. Последняя ошибка — {last_error}")
+
+
 def _openrouter_vision(photo_bytes: bytes, prompt: str, api_key: str) -> str:
     """Синхронный запрос к OpenRouter с картинкой. Возвращает текст ответа модели."""
     photo_b64 = base64.standard_b64encode(bytes(photo_bytes)).decode("utf-8")
-    payload = {
-        "model": OPENROUTER_MODEL,
-        "messages": [
-            {
-                "role": "user",
-                "content": [
-                    {"type": "text", "text": prompt},
-                    {"type": "image_url", "image_url": {"url": f"data:image/jpeg;base64,{photo_b64}"}},
-                ],
-            }
-        ],
-    }
-    headers = {"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"}
-    resp = requests.post(OPENROUTER_URL, headers=headers, json=payload, timeout=60)
-    resp.raise_for_status()
-    data = resp.json()
-    return data["choices"][0]["message"]["content"].strip()
+    content = [
+        {"type": "text", "text": prompt},
+        {"type": "image_url", "image_url": {"url": f"data:image/jpeg;base64,{photo_b64}"}},
+    ]
+    text, _model = _openrouter_chat(content, api_key)
+    return text
 
 # Настройка логов
 logging.basicConfig(
@@ -536,26 +558,18 @@ async def diag_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
     else:
         lines.append("❌ OPENROUTER_API_KEY НЕ виден боту")
 
-    lines.append(f"ℹ️ Модель: {html.escape(OPENROUTER_MODEL)}")
+    lines.append(f"ℹ️ Моделей в очереди: {len(OPENROUTER_MODELS)}")
 
-    # 2. Пробный текстовый запрос к OpenRouter
+    # 2. Пробный запрос — перебираем модели, показываем какая ответила
     if api_key:
         try:
-            payload = {
-                "model": OPENROUTER_MODEL,
-                "messages": [{"role": "user", "content": "Ответь одним словом: работает"}],
-            }
-            headers = {"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"}
-            r = await asyncio.to_thread(
-                lambda: requests.post(OPENROUTER_URL, headers=headers, json=payload, timeout=30)
+            answer, used_model = await asyncio.to_thread(
+                _openrouter_chat, "Ответь одним словом: работает", api_key
             )
-            if r.status_code == 200:
-                answer = r.json()["choices"][0]["message"]["content"].strip()
-                lines.append(f"✅ OpenRouter отвечает: {html.escape(answer[:50])}")
-            else:
-                lines.append(f"❌ OpenRouter вернул {r.status_code}:\n<code>{html.escape(r.text[:300])}</code>")
+            lines.append(f"✅ Отвечает модель: {html.escape(used_model)}")
+            lines.append(f"   Ответ: {html.escape(answer[:50])}")
         except Exception as e:
-            lines.append(f"❌ OpenRouter не отвечает:\n<code>{html.escape(type(e).__name__)}: {html.escape(str(e))}</code>")
+            lines.append(f"❌ Ни одна модель не ответила:\n<code>{html.escape(str(e)[:400])}</code>")
 
     await update.message.reply_text("\n".join(lines), parse_mode="HTML")
 
