@@ -20,7 +20,7 @@ from telegram.ext import ApplicationBuilder, CallbackQueryHandler, CommandHandle
 # Распознавание чеков через OpenRouter (работает из РФ, обходит гео-блок Google).
 # Ключ берётся из переменной окружения OPENROUTER_API_KEY.
 OPENROUTER_URL = "https://openrouter.ai/api/v1/chat/completions"
-OPENROUTER_MODEL = "google/gemini-2.0-flash-001"
+OPENROUTER_MODEL = "qwen/qwen2.5-vl-72b-instruct:free"
 RECEIPT_PROMPT = (
     "Посмотри на этот чек и извлеки основную информацию. "
     "Ответь строго в формате: НАЗВАНИЕ|СУММА (только число, без валюты). "
