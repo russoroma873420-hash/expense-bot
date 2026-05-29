@@ -17,16 +17,19 @@ from io import BytesIO
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update, BotCommand
 from telegram.ext import ApplicationBuilder, CallbackQueryHandler, CommandHandler, ContextTypes, MessageHandler, filters, JobQueue
 
-# Распознавание чеков через OpenRouter (работает из РФ, обходит гео-блок Google).
-# Ключ берётся из переменной окружения OPENROUTER_API_KEY.
-OPENROUTER_URL = "https://openrouter.ai/api/v1/chat/completions"
-# Перебираем модели по порядку: берём первую, которая ответит.
-# Бесплатные (:free) идут первыми; если их пул занят (404/429) — пробуем следующую.
-OPENROUTER_MODELS = [
-    "qwen/qwen2.5-vl-72b-instruct:free",
-    "qwen/qwen2.5-vl-32b-instruct:free",
-    "meta-llama/llama-3.2-11b-vision-instruct:free",
-    "google/gemini-2.0-flash-exp:free",
+# Распознавание чеков через polza.ai (российский агрегатор, оплата в рублях, работает из РФ).
+# polza.ai — OpenAI-совместимый API. Ключ берётся из переменной окружения POLZA_API_KEY.
+LLM_BASE_URL = "https://api.polza.ai/api/v1"
+LLM_API_URL = f"{LLM_BASE_URL}/chat/completions"
+LLM_API_KEY_ENV = "POLZA_API_KEY"
+# Перебираем модели по порядку: берём первую, которая ответит и умеет читать картинки.
+# Дешёвые vision-модели идут первыми. Точные ID можно посмотреть командой /models.
+LLM_MODELS = [
+    "amazon/nova-lite-v1",
+    "anthropic/claude-3-haiku",
+    "anthropic/claude-3.5-haiku",
+    "qwen/qwen2.5-vl-72b-instruct",
+    "openai/gpt-4o-mini",
 ]
 RECEIPT_PROMPT = (
     "Посмотри на этот чек и извлеки основную информацию. "
@@ -37,18 +40,18 @@ RECEIPT_PROMPT = (
 )
 
 
-def _openrouter_chat(content, api_key: str):
-    """Перебирает OPENROUTER_MODELS, возвращает (текст_ответа, имя_модели).
+def _llm_chat(content, api_key: str):
+    """Перебирает LLM_MODELS, возвращает (текст_ответа, имя_модели).
     content — это значение поля message.content (строка или список частей)."""
     headers = {"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"}
     last_error = None
-    for model in OPENROUTER_MODELS:
+    for model in LLM_MODELS:
         payload = {"model": model, "messages": [{"role": "user", "content": content}]}
         try:
-            resp = requests.post(OPENROUTER_URL, headers=headers, json=payload, timeout=60)
-            if resp.status_code in (404, 429, 502, 503):
-                # модель недоступна/занята — пробуем следующую
-                last_error = f"{model}: HTTP {resp.status_code}"
+            resp = requests.post(LLM_API_URL, headers=headers, json=payload, timeout=60)
+            if resp.status_code in (400, 404, 429, 502, 503):
+                # модель недоступна/занята/не умеет картинки — пробуем следующую
+                last_error = f"{model}: HTTP {resp.status_code} {resp.text[:120]}"
                 continue
             resp.raise_for_status()
             data = resp.json()
@@ -63,15 +66,24 @@ def _openrouter_chat(content, api_key: str):
     raise RuntimeError(f"Все модели недоступны. Последняя ошибка — {last_error}")
 
 
-def _openrouter_vision(photo_bytes: bytes, prompt: str, api_key: str) -> str:
-    """Синхронный запрос к OpenRouter с картинкой. Возвращает текст ответа модели."""
+def _llm_vision(photo_bytes: bytes, prompt: str, api_key: str) -> str:
+    """Синхронный запрос с картинкой. Возвращает текст ответа модели."""
     photo_b64 = base64.standard_b64encode(bytes(photo_bytes)).decode("utf-8")
     content = [
         {"type": "text", "text": prompt},
         {"type": "image_url", "image_url": {"url": f"data:image/jpeg;base64,{photo_b64}"}},
     ]
-    text, _model = _openrouter_chat(content, api_key)
+    text, _model = _llm_chat(content, api_key)
     return text
+
+
+def _llm_list_models(api_key: str) -> list:
+    """Запрашивает список моделей у polza.ai (/models). Возвращает список словарей."""
+    headers = {"Authorization": f"Bearer {api_key}"}
+    resp = requests.get(f"{LLM_BASE_URL}/models", headers=headers, timeout=30)
+    resp.raise_for_status()
+    data = resp.json()
+    return data.get("data", data if isinstance(data, list) else [])
 
 # Настройка логов
 logging.basicConfig(
@@ -543,7 +555,7 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
 
 
 async def diag_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    # Самодиагностика: проверяем доступ к Gemini прямо из чата, без логов сервера
+    # Самодиагностика: проверяем доступ к polza.ai прямо из чата, без логов сервера
     user_id = update.effective_user.id
     if user_id not in ALLOWED_USER_IDS:
         await update.message.reply_text("Доступ запрещен")
@@ -551,27 +563,67 @@ async def diag_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
 
     lines = ["🔍 <b>Диагностика</b>\n"]
 
-    # 1. Виден ли ключ OpenRouter боту
-    api_key = os.environ.get("OPENROUTER_API_KEY")
+    # 1. Виден ли ключ polza.ai боту
+    api_key = os.environ.get(LLM_API_KEY_ENV)
     if api_key:
-        lines.append(f"✅ OPENROUTER_API_KEY виден (…{html.escape(api_key[-4:])})")
+        lines.append(f"✅ {LLM_API_KEY_ENV} виден (…{html.escape(api_key[-4:])})")
     else:
-        lines.append("❌ OPENROUTER_API_KEY НЕ виден боту")
+        lines.append(f"❌ {LLM_API_KEY_ENV} НЕ виден боту")
 
-    lines.append(f"ℹ️ Моделей в очереди: {len(OPENROUTER_MODELS)}")
+    lines.append(f"ℹ️ Моделей в очереди: {len(LLM_MODELS)}")
 
     # 2. Пробный запрос — перебираем модели, показываем какая ответила
     if api_key:
         try:
             answer, used_model = await asyncio.to_thread(
-                _openrouter_chat, "Ответь одним словом: работает", api_key
+                _llm_chat, "Ответь одним словом: работает", api_key
             )
             lines.append(f"✅ Отвечает модель: {html.escape(used_model)}")
             lines.append(f"   Ответ: {html.escape(answer[:50])}")
         except Exception as e:
-            lines.append(f"❌ Ни одна модель не ответила:\n<code>{html.escape(str(e)[:400])}</code>")
+            lines.append(f"❌ Ни одна модель не ответила:\n<code>{html.escape(str(e)[:500])}</code>")
+            lines.append("\nПодсказка: нажми /models — покажу точные ID доступных моделей.")
 
     await update.message.reply_text("\n".join(lines), parse_mode="HTML")
+
+
+async def models_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    # Показывает реальные ID моделей от polza.ai, чтобы не угадывать имена
+    user_id = update.effective_user.id
+    if user_id not in ALLOWED_USER_IDS:
+        await update.message.reply_text("Доступ запрещен")
+        return
+
+    api_key = os.environ.get(LLM_API_KEY_ENV)
+    if not api_key:
+        await update.message.reply_text(f"❌ Переменная {LLM_API_KEY_ENV} не установлена")
+        return
+
+    try:
+        models = await asyncio.to_thread(_llm_list_models, api_key)
+    except Exception as e:
+        await update.message.reply_text(
+            f"❌ Не удалось получить список моделей:\n<code>{html.escape(str(e)[:400])}</code>",
+            parse_mode="HTML",
+        )
+        return
+
+    # Вытаскиваем id и отбираем те, что похожи на vision-модели
+    ids = [m.get("id", "") for m in models if isinstance(m, dict) and m.get("id")]
+    keywords = ("vl", "vision", "claude", "gpt-4o", "nova", "gemini", "qwen", "pixtral", "llama-3.2")
+    vision_ids = [i for i in ids if any(k in i.lower() for k in keywords)]
+
+    if vision_ids:
+        text = "🖼 <b>Модели с распознаванием картинок</b> (всего моделей: {}):\n\n".format(len(ids))
+        text += "\n".join(f"<code>{html.escape(i)}</code>" for i in vision_ids[:60])
+    elif ids:
+        text = "📋 <b>Доступные модели</b> (первые 60 из {}):\n\n".format(len(ids))
+        text += "\n".join(f"<code>{html.escape(i)}</code>" for i in ids[:60])
+    else:
+        text = "Список моделей пуст или формат ответа неожиданный."
+
+    # Telegram ограничивает длину сообщения ~4096 символов
+    await update.message.reply_text(text[:4000], parse_mode="HTML")
 
 
 async def stats_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -853,14 +905,14 @@ async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
         file = await update.message.photo[-1].get_file()
         photo_bytes = await file.download_as_bytearray()
 
-        api_key = os.environ.get("OPENROUTER_API_KEY")
+        api_key = os.environ.get(LLM_API_KEY_ENV)
         if not api_key:
-            await update.message.reply_text("❌ Ошибка: переменная OPENROUTER_API_KEY не установлена")
+            await update.message.reply_text(f"❌ Ошибка: переменная {LLM_API_KEY_ENV} не установлена")
             return
 
         # Синхронный HTTP-запрос выносим в поток, чтобы не блокировать бота
         response_text = await asyncio.to_thread(
-            _openrouter_vision, photo_bytes, RECEIPT_PROMPT, api_key
+            _llm_vision, photo_bytes, RECEIPT_PROMPT, api_key
         )
 
         if "ОШИБКА" in response_text.upper():
@@ -1518,6 +1570,7 @@ def main() -> None:
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("help", help_command))
     app.add_handler(CommandHandler("diag", diag_command))
+    app.add_handler(CommandHandler("models", models_command))
     app.add_handler(CommandHandler("stats", stats_command))
     app.add_handler(CommandHandler("recent", recent_command))
     app.add_handler(CommandHandler("report", report_command))
@@ -1559,6 +1612,7 @@ def main() -> None:
                 BotCommand("addgoal", "Добавить цель"),
                 BotCommand("contribute", "Пополнить цель"),
                 BotCommand("diag", "Проверка распознавания чеков"),
+                BotCommand("models", "Список доступных моделей"),
                 BotCommand("help", "Справка"),
             ]
         )
