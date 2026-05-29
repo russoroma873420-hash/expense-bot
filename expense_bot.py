@@ -13,7 +13,7 @@ from io import BytesIO
 
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update, BotCommand
 from telegram.ext import ApplicationBuilder, CallbackQueryHandler, CommandHandler, ContextTypes, MessageHandler, filters, JobQueue
-from anthropic import Anthropic
+import google.generativeai as genai
 
 # Настройка логов
 logging.basicConfig(
@@ -763,40 +763,20 @@ async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
         file = await update.message.photo[-1].get_file()
         photo_bytes = await file.download_as_bytearray()
 
-        api_key = os.environ.get("ANTHROPIC_API_KEY")
+        api_key = os.environ.get("GEMINI_API_KEY")
         if not api_key:
-            await update.message.reply_text("❌ Ошибка: переменная ANTHROPIC_API_KEY не установлена")
+            await update.message.reply_text("❌ Ошибка: переменная GEMINI_API_KEY не установлена")
             return
 
-        import base64
-        photo_base64 = base64.standard_b64encode(photo_bytes).decode("utf-8")
+        genai.configure(api_key=api_key)
+        model = genai.GenerativeModel("gemini-2.0-flash")
 
-        client = Anthropic(api_key=api_key)
-        message = client.messages.create(
-            model="claude-sonnet-4-20250514",
-            max_tokens=1024,
-            messages=[
-                {
-                    "role": "user",
-                    "content": [
-                        {
-                            "type": "image",
-                            "source": {
-                                "type": "base64",
-                                "media_type": "image/jpeg",
-                                "data": photo_base64,
-                            },
-                        },
-                        {
-                            "type": "text",
-                            "text": "Посмотри на этот чек и извлеки основную информацию. Ответь в формате: НАЗВАНИЕ|СУММА (только число, без валюты). Например: кофе эспрессо|450 или пицца маргарита|650. Если на чеке несколько товаров, выбери самый дорогой. Если не можешь распознать чек, ответь только: ОШИБКА"
-                        }
-                    ],
-                }
-            ],
-        )
+        message = model.generate_content([
+            "Посмотри на этот чек и извлеки основную информацию. Ответь в формате: НАЗВАНИЕ|СУММА (только число, без валюты). Например: кофе эспрессо|450 или пицца маргарита|650. Если на чеке несколько товаров, выбери самый дорогой. Если не можешь распознать чек, ответь только: ОШИБКА",
+            {"mime_type": "image/jpeg", "data": photo_bytes}
+        ])
 
-        response_text = message.content[0].text.strip()
+        response_text = message.text.strip()
 
         if "ОШИБКА" in response_text.upper():
             await update.message.reply_text(

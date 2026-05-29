@@ -1,4 +1,4 @@
 python-telegram-bot
 matplotlib
-anthropic
+google-generativeai
 pytz
