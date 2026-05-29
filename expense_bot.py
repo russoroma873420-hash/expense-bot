@@ -25,11 +25,10 @@ LLM_API_KEY_ENV = "POLZA_API_KEY"
 # Перебираем модели по порядку: берём первую, которая ответит и умеет читать картинки.
 # Дешёвые vision-модели идут первыми. Точные ID можно посмотреть командой /models.
 LLM_MODELS = [
+    "qwen/qwen3-vl-8b-instruct",
+    "qwen/qwen3-vl-32b-instruct",
     "amazon/nova-lite-v1",
-    "anthropic/claude-3-haiku",
-    "anthropic/claude-3.5-haiku",
-    "qwen/qwen2.5-vl-72b-instruct",
-    "openai/gpt-4o-mini",
+    "google/gemini-3.5-flash",
 ]
 RECEIPT_PROMPT = (
     "Посмотри на этот чек и извлеки основную информацию. "
