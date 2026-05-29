@@ -5,7 +5,7 @@ import sqlite3
 import csv
 import io
 import html
-from datetime import datetime, date, timedelta
+from datetime import datetime, date, timedelta, time as dt_time
 import pytz
 import matplotlib.pyplot as plt
 import matplotlib.dates as mdates
@@ -1353,6 +1353,9 @@ async def handle_category(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
 async def weekly_summary(context: ContextTypes.DEFAULT_TYPE) -> None:
     # Получаем текущую дату и вычисляем начало и конец недели (пн-вс)
     today = date.today()
+    # Сводку отправляем только по воскресеньям (понедельник=0 ... воскресенье=6)
+    if today.weekday() != 6:
+        return
     # Вычисляем понедельник этой недели
     monday = today - timedelta(days=today.weekday())
     sunday = monday + timedelta(days=6)
@@ -1442,14 +1445,14 @@ def main() -> None:
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
     app.add_handler(CallbackQueryHandler(handle_category))
 
-    # Настраиваем еженедельную сводку (воскресенье, 19:00 MSK)
+    # Настраиваем еженедельную сводку (воскресенье, 19:00 МСК).
+    # В python-telegram-bot нет run_weekly, поэтому запускаем ежедневно в 19:00 МСК,
+    # а сама функция weekly_summary отправляет сводку только по воскресеньям.
     job_queue = app.job_queue
-    job_queue.run_weekly(
+    job_queue.run_daily(
         weekly_summary,
-        day=6,  # 6 = воскресенье (0 = понедельник, ... 6 = воскресенье)
-        time=datetime.min.replace(hour=19, minute=0).time(),
+        time=dt_time(hour=19, minute=0, tzinfo=MOSCOW_TZ),
         name="weekly_summary",
-        tzinfo=MOSCOW_TZ,
     )
 
     async def post_init(app):
