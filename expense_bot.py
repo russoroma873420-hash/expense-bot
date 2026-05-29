@@ -5,15 +5,51 @@ import sqlite3
 import csv
 import io
 import html
+import base64
+import asyncio
 from datetime import datetime, date, timedelta, time as dt_time
 import pytz
+import requests
 import matplotlib.pyplot as plt
 import matplotlib.dates as mdates
 from io import BytesIO
 
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update, BotCommand
 from telegram.ext import ApplicationBuilder, CallbackQueryHandler, CommandHandler, ContextTypes, MessageHandler, filters, JobQueue
-import google.generativeai as genai
+
+# Распознавание чеков через OpenRouter (работает из РФ, обходит гео-блок Google).
+# Ключ берётся из переменной окружения OPENROUTER_API_KEY.
+OPENROUTER_URL = "https://openrouter.ai/api/v1/chat/completions"
+OPENROUTER_MODEL = "google/gemini-2.0-flash-001"
+RECEIPT_PROMPT = (
+    "Посмотри на этот чек и извлеки основную информацию. "
+    "Ответь строго в формате: НАЗВАНИЕ|СУММА (только число, без валюты). "
+    "Например: кофе эспрессо|450 или пицца маргарита|650. "
+    "Если на чеке несколько товаров, выбери самый дорогой или итоговую сумму. "
+    "Если не можешь распознать чек, ответь только: ОШИБКА"
+)
+
+
+def _openrouter_vision(photo_bytes: bytes, prompt: str, api_key: str) -> str:
+    """Синхронный запрос к OpenRouter с картинкой. Возвращает текст ответа модели."""
+    photo_b64 = base64.standard_b64encode(bytes(photo_bytes)).decode("utf-8")
+    payload = {
+        "model": OPENROUTER_MODEL,
+        "messages": [
+            {
+                "role": "user",
+                "content": [
+                    {"type": "text", "text": prompt},
+                    {"type": "image_url", "image_url": {"url": f"data:image/jpeg;base64,{photo_b64}"}},
+                ],
+            }
+        ],
+    }
+    headers = {"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"}
+    resp = requests.post(OPENROUTER_URL, headers=headers, json=payload, timeout=60)
+    resp.raise_for_status()
+    data = resp.json()
+    return data["choices"][0]["message"]["content"].strip()
 
 # Настройка логов
 logging.basicConfig(
@@ -493,29 +529,33 @@ async def diag_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
 
     lines = ["🔍 <b>Диагностика</b>\n"]
 
-    # 1. Виден ли ключ Gemini боту
-    api_key = os.environ.get("GEMINI_API_KEY")
+    # 1. Виден ли ключ OpenRouter боту
+    api_key = os.environ.get("OPENROUTER_API_KEY")
     if api_key:
-        lines.append(f"✅ GEMINI_API_KEY виден (…{html.escape(api_key[-4:])})")
+        lines.append(f"✅ OPENROUTER_API_KEY виден (…{html.escape(api_key[-4:])})")
     else:
-        lines.append("❌ GEMINI_API_KEY НЕ виден боту")
+        lines.append("❌ OPENROUTER_API_KEY НЕ виден боту")
 
-    # 2. Версия библиотеки
-    try:
-        ver = getattr(genai, "__version__", "?")
-        lines.append(f"✅ google-generativeai: {html.escape(str(ver))}")
-    except Exception as e:
-        lines.append(f"❌ Библиотека: {html.escape(str(e))}")
+    lines.append(f"ℹ️ Модель: {html.escape(OPENROUTER_MODEL)}")
 
-    # 3. Пробный запрос к Gemini
+    # 2. Пробный текстовый запрос к OpenRouter
     if api_key:
         try:
-            genai.configure(api_key=api_key)
-            model = genai.GenerativeModel("gemini-2.0-flash")
-            resp = model.generate_content("Ответь одним словом: работает")
-            lines.append(f"✅ Gemini отвечает: {html.escape(resp.text.strip()[:50])}")
+            payload = {
+                "model": OPENROUTER_MODEL,
+                "messages": [{"role": "user", "content": "Ответь одним словом: работает"}],
+            }
+            headers = {"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"}
+            r = await asyncio.to_thread(
+                lambda: requests.post(OPENROUTER_URL, headers=headers, json=payload, timeout=30)
+            )
+            if r.status_code == 200:
+                answer = r.json()["choices"][0]["message"]["content"].strip()
+                lines.append(f"✅ OpenRouter отвечает: {html.escape(answer[:50])}")
+            else:
+                lines.append(f"❌ OpenRouter вернул {r.status_code}:\n<code>{html.escape(r.text[:300])}</code>")
         except Exception as e:
-            lines.append(f"❌ Gemini не отвечает:\n<code>{html.escape(type(e).__name__)}: {html.escape(str(e))}</code>")
+            lines.append(f"❌ OpenRouter не отвечает:\n<code>{html.escape(type(e).__name__)}: {html.escape(str(e))}</code>")
 
     await update.message.reply_text("\n".join(lines), parse_mode="HTML")
 
@@ -799,20 +839,15 @@ async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
         file = await update.message.photo[-1].get_file()
         photo_bytes = await file.download_as_bytearray()
 
-        api_key = os.environ.get("GEMINI_API_KEY")
+        api_key = os.environ.get("OPENROUTER_API_KEY")
         if not api_key:
-            await update.message.reply_text("❌ Ошибка: переменная GEMINI_API_KEY не установлена")
+            await update.message.reply_text("❌ Ошибка: переменная OPENROUTER_API_KEY не установлена")
             return
 
-        genai.configure(api_key=api_key)
-        model = genai.GenerativeModel("gemini-2.0-flash")
-
-        message = model.generate_content([
-            "Посмотри на этот чек и извлеки основную информацию. Ответь в формате: НАЗВАНИЕ|СУММА (только число, без валюты). Например: кофе эспрессо|450 или пицца маргарита|650. Если на чеке несколько товаров, выбери самый дорогой. Если не можешь распознать чек, ответь только: ОШИБКА",
-            {"mime_type": "image/jpeg", "data": photo_bytes}
-        ])
-
-        response_text = message.text.strip()
+        # Синхронный HTTP-запрос выносим в поток, чтобы не блокировать бота
+        response_text = await asyncio.to_thread(
+            _openrouter_vision, photo_bytes, RECEIPT_PROMPT, api_key
+        )
 
         if "ОШИБКА" in response_text.upper():
             await update.message.reply_text(
