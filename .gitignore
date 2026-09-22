@@ -1,0 +1,27 @@
+# SQLite database file
+*.db
+
+# Virtual environments
+venv/
+bot-env/
+.env/
+.env
+
+# Python cache
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.pytest_cache/
+
+# Logs
+*.log
+
+# Editor directories
+.vscode/
+
+# Локальные документы и служебные каталоги: не для публичного репозитория
+SERVER.md
+SERVER.old-*.md
+deploy/
+backups/

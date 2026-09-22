@@ -1,0 +1,5 @@
+python-telegram-bot[job-queue]>=21.0
+matplotlib>=3.8
+requests>=2.31
+# База часовых поясов для zoneinfo. На Linux берётся системная, на Windows нужен этот пакет.
+tzdata
