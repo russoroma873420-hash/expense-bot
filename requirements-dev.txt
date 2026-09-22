@@ -1,0 +1,2 @@
+# Зависимости для запуска тестов: python -m pytest tests -q
+pytest>=8.0
