@@ -467,3 +467,39 @@ def test_rejected_duplicates_do_not_lock_the_database(db):
     assert expense_id > 0
     assert len(bot.get_recent_expenses(10)) == 1
     assert bot.delete_expense(expense_id) is True
+
+
+def test_goal_contribution_flow(db):
+    """Кнопка «Пополнить» → сумма → цель обновлена и человек получил ответ."""
+    goal_id = bot.add_goal("Отпуск", 150000.0)
+    context = _Context()
+
+    asyncio.run(
+        bot.handle_category(_CallbackUpdate(ALLOWED_ID, f"contrib_goal_{goal_id}"), context)
+    )
+    assert context.user_data["contrib_goal_id"] == goal_id
+    assert context.user_data["contrib_mode"] is True
+
+    update = _Update(ALLOWED_ID, "5000")
+    asyncio.run(bot.handle_message(update, context))
+
+    assert bot.get_goals() == [(goal_id, "Отпуск", 150000.0, 5000.0)]
+    assert context.user_data == {}
+    assert "Пополнено" in update.message.sent[-1]
+
+
+def test_goal_contribution_without_context_explains_itself(db):
+    """Потерянный контекст не должен приводить к молчанию.
+
+    Именно так и выглядел баг: бот не отвечал вообще, и было непонятно, что делать.
+    """
+    goal_id = bot.add_goal("Отпуск", 150000.0)
+    context = _Context()
+    context.user_data["contrib_mode"] = True  # contrib_goal_id потерялся
+
+    update = _Update(ALLOWED_ID, "5000")
+    asyncio.run(bot.handle_message(update, context))
+
+    assert update.message.sent, "бот не ответил — это и был баг"
+    assert "Не нашёл цель" in update.message.sent[-1]
+    assert bot.get_goals() == [(goal_id, "Отпуск", 150000.0, 0.0)]

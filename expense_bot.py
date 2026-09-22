@@ -1065,26 +1065,37 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
             await update.message.reply_text("Ошибка при добавлении цели")
         return
 
-    # Пополнение цели
+    # Пополнение цели. Ни одна ветка не молчит: если контекст потерялся или цель
+    # не нашлась, человек получит объяснение, а не тишину (так было раньше).
     if context.user_data.get("contrib_mode"):
         context.user_data.pop("contrib_mode")
+        goal_id = context.user_data.pop("contrib_goal_id", None)
         try:
             amount = float(text.replace(",", "."))
-            goal_id = context.user_data.pop("contrib_goal_id")
-            goal = next((g for g in get_goals() if g[0] == goal_id), None)
-            if goal:
-                goal_id, name, target, current = goal
-                new_current = current + amount
-                if update_goal(goal_id, new_current):
-                    percentage = (new_current / target * 100) if target > 0 else 0
-                    filled = int(percentage / 10)
-                    bar = "█" * filled + "░" * (10 - filled)
-                    await update.message.reply_text(
-                        f"✅ Пополнено!\n\n🎯 {html.escape(name)}\n{bar} {new_current:.0f}/{target:.0f} ₽ ({percentage:.0f}%)",
-                        parse_mode="HTML"
-                    )
         except ValueError:
-            await update.message.reply_text("Ошибка: введи число")
+            await update.message.reply_text("Ошибка: введи сумму числом, например 5000")
+            return
+
+        goal = next((g for g in get_goals() if g[0] == goal_id), None)
+        if not goal:
+            await update.message.reply_text(
+                "Не нашёл цель для пополнения. Откройте /goals и нажмите «➕ Пополнить» заново."
+            )
+            return
+
+        goal_id, name, target, current = goal
+        new_current = current + amount
+        if not update_goal(goal_id, new_current):
+            await update.message.reply_text("Не удалось обновить цель. Попробуйте ещё раз.")
+            return
+
+        percentage = (new_current / target * 100) if target > 0 else 0
+        filled = int(percentage / 10)
+        bar = "█" * filled + "░" * (10 - filled)
+        await update.message.reply_text(
+            f"✅ Пополнено!\n\n🎯 {html.escape(name)}\n{bar} {new_current:.0f}/{target:.0f} ₽ ({percentage:.0f}%)",
+            parse_mode="HTML"
+        )
         return
 
     # Редактирование названия расхода
